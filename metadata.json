@@ -1,0 +1,6 @@
+{
+  "name": "Mobile Studio X",
+  "description": "Mobile Android IDE and toolchain manager with Gradle, AAPT2, and native build engine support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
