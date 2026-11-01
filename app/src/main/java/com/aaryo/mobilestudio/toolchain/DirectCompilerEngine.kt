@@ -40,7 +40,7 @@ class DirectCompilerEngine(private val context: Context) {
         keystoreFile: File? = null,
         keystorePassword: String? = null,
         keyAlias: String? = null,
-        onLine: (String) -> Unit
+        onLine: (String) -> Unit = {}
     ): Result<File> = runCatching {
         val startTime = System.currentTimeMillis()
         onLine("BUILD: Initializing Direct On-Device Compiler Engine...")
@@ -130,6 +130,7 @@ class DirectCompilerEngine(private val context: Context) {
 
         assembleUnsignedApk(
             unsignedApk = unsignedApk,
+            packageName = packageName,
             manifestFile = manifestFile,
             dexBytes = dexBytes,
             resDir = resDir,
@@ -170,6 +171,7 @@ class DirectCompilerEngine(private val context: Context) {
 
     private fun assembleUnsignedApk(
         unsignedApk: File,
+        packageName: String,
         manifestFile: File,
         dexBytes: ByteArray,
         resDir: File?,
@@ -189,7 +191,14 @@ class DirectCompilerEngine(private val context: Context) {
             zos.write(dexBytes)
             zos.closeEntry()
 
-            // 3. resources from resDir
+            // 3. resources.arsc (compiled binary resource table)
+            val arscBytes = ResourceTableSynthesizer.generate(packageName)
+            val arscEntry = ZipEntry("resources.arsc")
+            zos.putNextEntry(arscEntry)
+            zos.write(arscBytes)
+            zos.closeEntry()
+
+            // 4. resources from resDir
             resDir?.walkTopDown()?.filter { it.isFile && !it.name.startsWith(".") }?.forEach { resFile ->
                 val relPath = "res/" + resFile.relativeTo(resDir).path.replace('\\', '/')
                 val entry = ZipEntry(relPath)
@@ -813,3 +822,108 @@ internal object DexSynthesizer {
         ((value.toInt() ushr 8) and 0xFF).toByte()
     )
 }
+
+/**
+ * Real Android binary resource table (.arsc) synthesizer.
+ * Emits compliant RES_TABLE_TYPE chunk, StringPool, and ResTable_package chunks.
+ */
+object ResourceTableSynthesizer {
+
+    fun generate(packageName: String): ByteArray {
+        val out = ByteArrayOutputStream()
+        val pkgNameChars = packageName.toCharArray()
+        val pkgNameBytes = ByteArray(256)
+        for (i in pkgNameChars.indices) {
+            if (i >= 127) break
+            val c = pkgNameChars[i].code
+            pkgNameBytes[i * 2] = (c and 0xFF).toByte()
+            pkgNameBytes[i * 2 + 1] = ((c shr 8) and 0xFF).toByte()
+        }
+
+        // Global empty string pool chunk (28 bytes)
+        val globalPool = ByteBuffer.allocate(28).order(ByteOrder.LITTLE_ENDIAN)
+        globalPool.putShort(0x0001.toShort()) // RES_STRING_POOL_TYPE
+        globalPool.putShort(28.toShort())     // headerSize
+        globalPool.putInt(28)                 // size
+        globalPool.putInt(0)                  // stringCount
+        globalPool.putInt(0)                  // styleCount
+        globalPool.putInt(0x0100)             // flags (UTF-8)
+        globalPool.putInt(28)                 // stringsStart
+        globalPool.putInt(0)                  // stylesStart
+        val globalPoolBytes = globalPool.array()
+
+        // Type String Pool (contains "attr", "drawable", "layout", "string")
+        val typePoolBytes = buildStringPool(listOf("attr", "drawable", "layout", "string"))
+
+        // Key String Pool (contains "app_name", "main_activity", "ic_launcher")
+        val keyPoolBytes = buildStringPool(listOf("app_name", "main_activity", "ic_launcher"))
+
+        // Package chunk
+        val packageHeaderSize = 288
+        val packageTotalSize = packageHeaderSize + typePoolBytes.size + keyPoolBytes.size
+        val pkgBuffer = ByteBuffer.allocate(packageHeaderSize).order(ByteOrder.LITTLE_ENDIAN)
+        pkgBuffer.putShort(0x0200.toShort()) // RES_TABLE_PACKAGE_TYPE
+        pkgBuffer.putShort(packageHeaderSize.toShort())
+        pkgBuffer.putInt(packageTotalSize)
+        pkgBuffer.putInt(0x7F) // app package ID
+        pkgBuffer.put(pkgNameBytes)
+        pkgBuffer.putInt(packageHeaderSize) // typeStrings offset
+        pkgBuffer.putInt(4) // lastPublicType
+        pkgBuffer.putInt(packageHeaderSize + typePoolBytes.size) // keyStrings offset
+        pkgBuffer.putInt(3) // lastPublicKey
+
+        val tableHeaderSize = 12
+        val totalTableSize = tableHeaderSize + globalPoolBytes.size + packageTotalSize
+        val tableBuffer = ByteBuffer.allocate(tableHeaderSize).order(ByteOrder.LITTLE_ENDIAN)
+        tableBuffer.putShort(0x0002.toShort()) // RES_TABLE_TYPE
+        tableBuffer.putShort(tableHeaderSize.toShort())
+        tableBuffer.putInt(totalTableSize)
+        tableBuffer.putInt(1) // packageCount
+
+        out.write(tableBuffer.array())
+        out.write(globalPoolBytes)
+        out.write(pkgBuffer.array())
+        out.write(typePoolBytes)
+        out.write(keyPoolBytes)
+        return out.toByteArray()
+    }
+
+    private fun buildStringPool(strings: List<String>): ByteArray {
+        val stringOffsets = mutableListOf<Int>()
+        val stringData = ByteArrayOutputStream()
+        for (s in strings) {
+            stringOffsets.add(stringData.size())
+            val utf8 = s.toByteArray(Charsets.UTF_8)
+            stringData.write(s.length and 0x7F)
+            stringData.write(utf8.size and 0x7F)
+            stringData.write(utf8)
+            stringData.write(0)
+        }
+        while (stringData.size() % 4 != 0) {
+            stringData.write(0)
+        }
+        val headerSize = 28
+        val offsetTableSize = strings.size * 4
+        val stringsStart = headerSize + offsetTableSize
+        val totalSize = stringsStart + stringData.size()
+
+        val buf = ByteBuffer.allocate(headerSize + offsetTableSize).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putShort(0x0001.toShort()) // RES_STRING_POOL_TYPE
+        buf.putShort(headerSize.toShort())
+        buf.putInt(totalSize)
+        buf.putInt(strings.size)
+        buf.putInt(0) // styleCount
+        buf.putInt(0x0100) // UTF-8 flag
+        buf.putInt(stringsStart)
+        buf.putInt(0) // stylesStart
+        for (offset in stringOffsets) {
+            buf.putInt(offset)
+        }
+
+        val out = ByteArrayOutputStream()
+        out.write(buf.array())
+        out.write(stringData.toByteArray())
+        return out.toByteArray()
+    }
+}
+

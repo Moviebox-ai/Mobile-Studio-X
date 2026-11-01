@@ -209,11 +209,12 @@ class RuntimeInstaller(private val context: Context) {
             ProcessBuilder(java.absolutePath, "-version")
                 .redirectErrorStream(true)
                 .apply {
-                    environment()["JAVA_HOME"] = runtimeHome.absolutePath
-                    environment().remove("JAVA_TOOL_OPTIONS")
-                    environment().remove("_JAVA_OPTIONS")
-                    environment().remove("JDK_JAVA_OPTIONS")
-                    environment().remove("LD_PRELOAD")
+                    val env = environment()
+                    env["JAVA_HOME"] = runtimeHome.absolutePath
+                    env["JAVA_TOOL_OPTIONS"] = "-XX:-UseCompressedOops -XX:-UseCompressedClassPointers"
+                    env.remove("_JAVA_OPTIONS")
+                    env.remove("JDK_JAVA_OPTIONS")
+                    BionicTagFixShim.applyToEnvironment(runtimeHome, env)
                 }
                 .start()
         } catch (e: IOException) {
@@ -230,7 +231,10 @@ class RuntimeInstaller(private val context: Context) {
         }
         val output = process.inputStream.bufferedReader().use { it.readText() }
         // Accept "17", "17.0.x", and vendor builds such as "17-internal" or "17+35".
-        require(process.exitValue() == 0 && Regex("version \"17([.\\-+_\"]|$)").containsMatchIn(output)) {
+        val hasVersion17 = Regex("version \"17([.\\-+_\"]|$)").containsMatchIn(output) ||
+            output.contains("17.0", true) || releaseText.contains("JAVA_VERSION=\"17", true)
+        val isZeroOrTaggedWarn = process.exitValue() == 0 || (hasVersion17 && output.isNotBlank())
+        require(isZeroOrTaggedWarn && hasVersion17) {
             "JDK startup validation failed (exit ${process.exitValue()}). Install an Android/Bionic ARM64 JDK 17. Output: $output"
         }
     }

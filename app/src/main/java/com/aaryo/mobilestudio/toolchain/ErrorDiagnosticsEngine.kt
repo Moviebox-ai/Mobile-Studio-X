@@ -35,6 +35,21 @@ object ErrorDiagnosticsEngine {
     fun analyze(logs: List<String>, projectDir: File?): BuildDiagnostic {
         val fullText = logs.joinToString("\n")
 
+        // Linker error on child process / shim
+        if (fullText.contains("invalid e_shstrndx", true) || (fullText.contains("CANNOT LINK EXECUTABLE", true) && fullText.contains("libtagfix.so", true))) {
+            val relevant = logs.filter { it.contains("linker", true) || it.contains("libtagfix.so", true) || it.contains("CANNOT LINK", true) }
+            return BuildDiagnostic(
+                category = ErrorCategory.TAGGED_POINTER_SIGABRT,
+                title = "Android Bionic Linker ELF Validation Error",
+                summary = "The dynamic linker rejected the compatibility shim due to section header constraints.",
+                filePath = "toolchain/compat/libtagfix.so",
+                lineNumber = null,
+                rootCause = "Android 8.0+ Bionic linker requires e_shstrndx != 0 and valid section header table for shared objects.",
+                recommendedFix = "The app has regenerated a compliant 64-bit ELF shim with valid section headers. You can also use Compiler Mode: Direct On-Device Compiler for in-process compilation.",
+                relevantLogs = relevant.ifEmpty { logs.takeLast(10) }
+            )
+        }
+
         // 0. JVM died while booting Gradle (exit 134/139/137). Report the REAL output instead of
         // guessing a cause: only blame tagged pointers when the log actually says so.
         val taggedEvidence = fullText.contains("tagged-pointers", true) || fullText.contains("Pointer tag for", true)

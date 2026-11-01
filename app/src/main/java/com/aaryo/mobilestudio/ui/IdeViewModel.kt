@@ -109,6 +109,26 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         ensureToolchainPermissions()
+        seedInitialProjectIfEmpty()
+    }
+
+    private fun seedInitialProjectIfEmpty() {
+        if (workspace.listProjects().isEmpty()) {
+            viewModelScope.launch {
+                runCatching {
+                    val starter = workspace.createFromTemplate(
+                        type = TemplateType.COMPOSE,
+                        rawName = "MobileStudioApp",
+                        rawPackage = "com.mobilestudio.demo"
+                    )
+                    _project.value = starter
+                    refreshProjects()
+                    append("Created starter project 'MobileStudioApp' (Compose + Material 3).")
+                }.onFailure {
+                    append("Starter project initialization notice: ${it.message}")
+                }
+            }
+        }
     }
 
     private fun retainReadPermission(uri: Uri) {

@@ -44,7 +44,12 @@ object BionicTagFixShim {
         val compatDir = File(baseDir, "toolchain/compat").apply { mkdirs() }
         val soFile = File(compatDir, SHIM_FILE_NAME)
 
-        if (!soFile.isFile || soFile.length() != 4096L) {
+        val existingBytes = runCatching { soFile.readBytes() }.getOrNull()
+        // If file is missing or old invalid ELF (where e_shstrndx at offset 62 is 0), regenerate
+        val needsRewrite = existingBytes == null || existingBytes.size != 4096 ||
+            ByteBuffer.wrap(existingBytes).order(ByteOrder.LITTLE_ENDIAN).getShort(62).toInt() == 0
+
+        if (needsRewrite) {
             soFile.writeBytes(buildArm64TagFixElf())
             soFile.setReadable(true, false)
             soFile.setExecutable(true, false)
@@ -67,6 +72,8 @@ object BionicTagFixShim {
         if (shimPath !in entries) {
             env["LD_PRELOAD"] = if (existing.isEmpty()) shimPath else "$shimPath:$existing"
         }
+        env["MALLOC_CHECK_"] = "0"
+        env["SCUDO_OPTIONS"] = "ZeroContents=false:DeallocTypeMismatch=false:DeleteSizeMismatch=false"
     }
 
     /**
@@ -75,15 +82,14 @@ object BionicTagFixShim {
      * 2. Imports `mallopt` via `.rela.plt` / `.got.plt`
      * 3. Registers `init_tagfix` in `DT_INIT_ARRAY` (`.init_array`)
      * 4. Executes `mallopt(-204, 0)` (`M_BIONIC_SET_HEAP_TAGGING_LEVEL`, `M_HEAP_TAGGING_LEVEL_NONE`)
+     * 5. Includes a strictly valid Section Header Table (`e_shoff`, `e_shnum`, `e_shentsize`, `e_shstrndx = 1`)
+     *    with matching `SHT_DYNAMIC` and `SHT_STRTAB` entries, fully conforming to Android Bionic's
+     *    dynamic linker verification (`linker_phdr.cpp`) to prevent `invalid e_shstrndx` fatal aborts.
      */
-    private fun buildArm64TagFixElf(): ByteArray {
+    fun buildArm64TagFixElf(): ByteArray {
         val buf = ByteBuffer.allocate(4096).order(ByteOrder.LITTLE_ENDIAN)
 
         // String table (.dynstr) at 0x200
-        //   0x00: ""
-        //   0x01: "libc.so"
-        //   0x09: "mallopt"
-        //   0x11: "libtagfix.so"
         val dynstrOffset = 0x200
         val dynstrBytes = "\u0000libc.so\u0000mallopt\u0000libtagfix.so\u0000".toByteArray(Charsets.US_ASCII)
         buf.position(dynstrOffset)
@@ -119,11 +125,11 @@ object BionicTagFixShim {
         buf.putLong(0L) // r_addend
 
         // Code (.plt + .text) at 0x300
-        // PLT stub at 0x300Loads GOT slot at 0x518 and branches to mallopt:
-        //   0x300: adrp x16, 0x0        -> 0x90000010 (page of 0x300 is 0x0, same page as 0x518)
-        //   0x304: ldr  x17, [x16, #0x518] -> 0xF9428E11 (offset 0x518 / 8 = 163 = 0xA3; imm12 = 0xA3)
-        //   0x308: br   x17             -> 0xD61F0220
-        //   0x30c: nop                  -> 0xD503201F
+        // PLT stub at 0x300 loads GOT slot at 0x518 and branches to mallopt:
+        //   0x300: adrp x16, 0x0
+        //   0x304: ldr  x17, [x16, #0x518]
+        //   0x308: br   x17
+        //   0x30c: nop
         val pltOffset = 0x300
         buf.position(pltOffset)
         buf.putInt(0x90000010.toInt()) // adrp x16, #0
@@ -136,7 +142,7 @@ object BionicTagFixShim {
         //   mov x29, sp                 -> 0x910003FD
         //   mov w0, #-204               -> 0x12801960 (M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204)
         //   mov w1, #0                  -> 0x52800001 (M_HEAP_TAGGING_LEVEL_NONE = 0)
-        //   bl  0x300                   -> 0x97FFFFFA (calls PLT stub at 0x300 from 0x320: offset -16 bytes)
+        //   bl  0x300                   -> 0x97FFFFFA (calls PLT stub at 0x300 from 0x320)
         //   ldp x29, x30, [sp], #16     -> 0xA8C17BFD
         //   ret                         -> 0xD65F03C0
         val initFuncOffset = 0x310
@@ -148,6 +154,18 @@ object BionicTagFixShim {
         buf.putInt(0x97FFFFFA.toInt()) // bl 0x300
         buf.putInt(0xA8C17BFD.toInt()) // ldp x29, x30, [sp], #16
         buf.putInt(0xD65F03C0.toInt()) // ret
+
+        // Section header string table (.shstrtab) at 0x400
+        //   0: ""
+        //   1: ".shstrtab"
+        //  11: ".dynstr"
+        //  19: ".dynamic"
+        //  28: ".text"
+        //  34: ".init_array"
+        val shstrOffset = 0x400
+        val shstrBytes = "\u0000.shstrtab\u0000.dynstr\u0000.dynamic\u0000.text\u0000.init_array\u0000".toByteArray(Charsets.US_ASCII)
+        buf.position(shstrOffset)
+        buf.put(shstrBytes)
 
         // .init_array at 0x500 (8 bytes): pointer to init_tagfix (0x310)
         val initArrayOffset = 0x500
@@ -161,53 +179,65 @@ object BionicTagFixShim {
         buf.putLong(0L)
         buf.putLong(0x300L) // initial slot at 0x518
 
-        // .dynamic section at 0x520 (16 entries * 16 bytes = 256 bytes)
+        // .dynamic section at 0x520 (14 entries * 16 bytes = 224 bytes)
         val dynamicOffset = 0x520
         buf.position(dynamicOffset)
         fun putDyn(tag: Long, value: Long) {
             buf.putLong(tag)
             buf.putLong(value)
         }
-        putDyn(1L, 0x01L)                   // DT_NEEDED = "libc.so"
-        putDyn(14L, 0x11L)                  // DT_SONAME = "libtagfix.so"
-        putDyn(25L, initArrayOffset.toLong()) // DT_INIT_ARRAY = 0x500
-        putDyn(27L, 8L)                     // DT_INIT_ARRAYSZ = 8
-        putDyn(4L, hashOffset.toLong())     // DT_HASH = 0x280
-        putDyn(5L, dynstrOffset.toLong())   // DT_STRTAB = 0x200
-        putDyn(6L, dynsymOffset.toLong())   // DT_SYMTAB = 0x240
+        putDyn(1L, 0x01L)                      // DT_NEEDED = "libc.so"
+        putDyn(14L, 0x11L)                     // DT_SONAME = "libtagfix.so"
+        putDyn(25L, initArrayOffset.toLong())  // DT_INIT_ARRAY = 0x500
+        putDyn(27L, 8L)                        // DT_INIT_ARRAYSZ = 8
+        putDyn(4L, hashOffset.toLong())        // DT_HASH = 0x280
+        putDyn(5L, dynstrOffset.toLong())      // DT_STRTAB = 0x200
+        putDyn(6L, dynsymOffset.toLong())      // DT_SYMTAB = 0x240
         putDyn(10L, dynstrBytes.size.toLong()) // DT_STRSZ
-        putDyn(11L, 24L)                    // DT_SYMENT = 24
-        putDyn(3L, gotPltOffset.toLong())   // DT_PLTGOT = 0x508
-        putDyn(2L, 24L)                     // DT_PLTRELSZ = 24
-        putDyn(20L, 7L)                     // DT_PLTREL = DT_RELA (7)
-        putDyn(23L, relaPltOffset.toLong()) // DT_JMPREL = 0x2A0
-        putDyn(0L, 0L)                      // DT_NULL
+        putDyn(11L, 24L)                       // DT_SYMENT = 24
+        putDyn(3L, gotPltOffset.toLong())      // DT_PLTGOT = 0x508
+        putDyn(2L, 24L)                        // DT_PLTRELSZ = 24
+        putDyn(20L, 7L)                        // DT_PLTREL = DT_RELA (7)
+        putDyn(23L, relaPltOffset.toLong())    // DT_JMPREL = 0x2A0
+        putDyn(0L, 0L)                         // DT_NULL
+        val dynamicSize = 14 * 16
 
-        // ELF64 Header at 0x00 (64 bytes)
-        val phdrOffset = 0x40
-        val phdrCount = 3
-        buf.position(0)
-        buf.put(byteArrayOf(0x7f, 'E'.code.toByte(), 'L'.code.toByte(), 'F'.code.toByte()))
-        buf.put(2.toByte()) // EI_CLASS = ELFCLASS64
-        buf.put(1.toByte()) // EI_DATA = ELFDATA2LSB
-        buf.put(1.toByte()) // EI_VERSION = EV_CURRENT
-        buf.put(0.toByte()) // EI_OSABI = ELFOSABI_SYSV
-        buf.putLong(0L)     // padding
-        buf.putShort(3.toShort())   // e_type = ET_DYN
-        buf.putShort(183.toShort()) // e_machine = EM_AARCH64
-        buf.putInt(1)               // e_version = EV_CURRENT
-        buf.putLong(0L)             // e_entry
-        buf.putLong(phdrOffset.toLong()) // e_phoff = 64
-        buf.putLong(0L)             // e_shoff = 0
-        buf.putInt(0)               // e_flags
-        buf.putShort(64.toShort())  // e_ehsize = 64
-        buf.putShort(56.toShort())  // e_phentsize = 56
-        buf.putShort(phdrCount.toShort()) // e_phnum = 3
-        buf.putShort(64.toShort())  // e_shentsize = 64
-        buf.putShort(0.toShort())   // e_shnum = 0
-        buf.putShort(0.toShort())   // e_shstrndx = 0
+        // Section Headers at 0x700 (6 headers * 64 bytes = 384 bytes, 8-byte aligned)
+        val shdrOffset = 0x700
+        val shdrCount = 6
+        fun putShdr(
+            name: Int, type: Int, flags: Long, addr: Long, offset: Long,
+            size: Long, link: Int, info: Int, align: Long, entSize: Long
+        ) {
+            buf.putInt(name)
+            buf.putInt(type)
+            buf.putLong(flags)
+            buf.putLong(addr)
+            buf.putLong(offset)
+            buf.putLong(size)
+            buf.putInt(link)
+            buf.putInt(info)
+            buf.putLong(align)
+            buf.putLong(entSize)
+        }
+
+        buf.position(shdrOffset)
+        // 0: SHT_NULL
+        putShdr(0, 0, 0L, 0L, 0L, 0L, 0, 0, 0L, 0L)
+        // 1: .shstrtab (type = SHT_STRTAB = 3) -> referenced by e_shstrndx = 1
+        putShdr(1, 3, 0L, 0L, shstrOffset.toLong(), shstrBytes.size.toLong(), 0, 0, 1L, 0L)
+        // 2: .dynstr (type = SHT_STRTAB = 3, SHF_ALLOC = 2) -> linked by .dynamic sh_link = 2
+        putShdr(11, 3, 2L, dynstrOffset.toLong(), dynstrOffset.toLong(), dynstrBytes.size.toLong(), 0, 0, 1L, 0L)
+        // 3: .dynamic (type = SHT_DYNAMIC = 6, SHF_WRITE | SHF_ALLOC = 3) -> matches PT_DYNAMIC phdr
+        putShdr(19, 6, 3L, dynamicOffset.toLong(), dynamicOffset.toLong(), dynamicSize.toLong(), 2, 0, 8L, 16L)
+        // 4: .text (type = SHT_PROGBITS = 1, SHF_ALLOC | SHF_EXECINSTR = 6)
+        putShdr(28, 1, 6L, 0x300L, 0x300L, 0x30L, 0, 0, 4L, 0L)
+        // 5: .init_array (type = SHT_INIT_ARRAY = 14, SHF_WRITE | SHF_ALLOC = 3)
+        putShdr(34, 14, 3L, initArrayOffset.toLong(), initArrayOffset.toLong(), 8L, 0, 0, 8L, 8L)
 
         // Program Headers at 0x40 (3 * 56 bytes)
+        val phdrOffset = 0x40
+        val phdrCount = 3
         buf.position(phdrOffset)
         fun putPhdr(type: Int, flags: Int, offset: Long, vaddr: Long, filesz: Long, memsz: Long, align: Long) {
             buf.putInt(type)
@@ -225,18 +255,18 @@ object BionicTagFixShim {
             flags = 7, // PF_R | PF_W | PF_X
             offset = 0L,
             vaddr = 0L,
-            filesz = 0x700L,
-            memsz = 0x700L,
+            filesz = 0x1000L,
+            memsz = 0x1000L,
             align = 0x1000L
         )
-        // 2. PT_DYNAMIC
+        // 2. PT_DYNAMIC (matches .dynamic section at 0x520)
         putPhdr(
             type = 2, // PT_DYNAMIC
             flags = 6, // PF_R | PF_W
             offset = dynamicOffset.toLong(),
             vaddr = dynamicOffset.toLong(),
-            filesz = 14L * 16L,
-            memsz = 14L * 16L,
+            filesz = dynamicSize.toLong(),
+            memsz = dynamicSize.toLong(),
             align = 8L
         )
         // 3. PT_GNU_STACK (RW, non-executable stack)
@@ -249,6 +279,28 @@ object BionicTagFixShim {
             memsz = 0L,
             align = 16L
         )
+
+        // ELF64 Header at 0x00 (64 bytes)
+        buf.position(0)
+        buf.put(byteArrayOf(0x7f, 'E'.code.toByte(), 'L'.code.toByte(), 'F'.code.toByte()))
+        buf.put(2.toByte()) // EI_CLASS = ELFCLASS64
+        buf.put(1.toByte()) // EI_DATA = ELFDATA2LSB
+        buf.put(1.toByte()) // EI_VERSION = EV_CURRENT
+        buf.put(0.toByte()) // EI_OSABI = ELFOSABI_SYSV
+        buf.putLong(0L)     // padding
+        buf.putShort(3.toShort())   // e_type = ET_DYN
+        buf.putShort(183.toShort()) // e_machine = EM_AARCH64
+        buf.putInt(1)               // e_version = EV_CURRENT
+        buf.putLong(0L)             // e_entry
+        buf.putLong(phdrOffset.toLong()) // e_phoff = 64 (0x40)
+        buf.putLong(shdrOffset.toLong()) // e_shoff = 1792 (0x700)
+        buf.putInt(0)               // e_flags
+        buf.putShort(64.toShort())  // e_ehsize = 64
+        buf.putShort(56.toShort())  // e_phentsize = 56
+        buf.putShort(phdrCount.toShort()) // e_phnum = 3
+        buf.putShort(64.toShort())  // e_shentsize = 64
+        buf.putShort(shdrCount.toShort()) // e_shnum = 6
+        buf.putShort(1.toShort())   // e_shstrndx = 1 (.shstrtab index; non-zero!)
 
         return buf.array()
     }

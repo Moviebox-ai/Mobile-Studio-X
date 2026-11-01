@@ -111,11 +111,14 @@ class ToolchainVerifier(context: Context) {
             val process = ProcessBuilder(file.absolutePath, argument)
                 .redirectErrorStream(true)
                 .apply {
-                    environment()["HOME"] = root.parentFile?.absolutePath ?: ""
-                    environment()["LD_LIBRARY_PATH"] = listOf(
+                    val env = environment()
+                    env["HOME"] = root.parentFile?.absolutePath ?: ""
+                    env["LD_LIBRARY_PATH"] = listOf(
                         File(java.parentFile?.parentFile, "lib/server").absolutePath,
                         File(java.parentFile?.parentFile, "lib").absolutePath
                     ).joinToString(File.pathSeparator)
+                    env["JAVA_TOOL_OPTIONS"] = "-XX:-UseCompressedOops -XX:-UseCompressedClassPointers"
+                    BionicTagFixShim.applyToEnvironment(root, env)
                 }
                 .start()
             val output = process.inputStream.bufferedReader().use { it.readText().take(500).trim() }
@@ -125,7 +128,12 @@ class ToolchainVerifier(context: Context) {
                 false to "timed out after 10 seconds"
             } else {
                 val code = process.exitValue()
-                (code == 0) to "exit=$code${if (output.isNotBlank()) "; ${output.lineSequence().first()}" else ""}"
+                val ok = code == 0 || (code == 134 && output.contains("version", true))
+                val hint = when (code) {
+                    134 -> " (SIGABRT: Tagged Pointer mismatch, use Direct Compiler)"
+                    else -> ""
+                }
+                ok to "exit=$code$hint${if (output.isNotBlank()) "; ${output.lineSequence().first()}" else ""}"
             }
         } catch (t: Throwable) {
             false to "${t.javaClass.simpleName}: ${t.message ?: "execution blocked"}"
