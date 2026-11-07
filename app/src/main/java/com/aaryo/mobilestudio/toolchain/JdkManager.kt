@@ -37,28 +37,40 @@ class JdkManager(private val context: Context, private val runner: ToolProcessRu
         jdkDir.mkdirs()
     }
 
-    /** Returns all known JDK slots and their installation state on device. */
+    /**
+     * Returns all known JDK slots and their installation state on device.
+     *
+     * "Installed" and "verified" are deliberately separate: a JDK archive can be extracted but
+     * still abort on this device (tagged-pointer/Scudo crashes). Previously a JDK living at any
+     * path other than `toolchain/runtime/bin/java` was reported as "Missing" in the UI even while
+     * the Gradle engine happily used it, so both sides now share [AndroidToolchain.javaCandidates].
+     */
     fun listInstallations(): List<JdkInstallation> {
+        val verificationError = AndroidToolchain.jdkVerificationError(toolchainRoot)
         val defaultRuntime = File(toolchainRoot, "runtime")
-        val defaultJava = File(defaultRuntime, "bin/java")
-        val hasDefaultJava = defaultJava.isFile && defaultJava.canExecute()
+        val defaultJava = File(defaultRuntime, "bin/java").takeIf { it.isFile }
+            ?: AndroidToolchain.findJava(toolchainRoot)
 
         return JdkVersion.entries.map { v ->
-            val specificDir = File(jdkDir, v.name.lowercase())
-            val specificJava = File(specificDir, "bin/java")
-            val isSpecific = specificJava.isFile && specificJava.canExecute()
-
-            // Default bundled JDK 17 fallback
-            val isTarget = isSpecific || (v == JdkVersion.JDK_17 && hasDefaultJava)
-            val effectiveHome = if (isSpecific) specificDir else defaultRuntime
-            val effectiveJava = if (isSpecific) specificJava else defaultJava
+            val slotDir = File(jdkDir, v.name.lowercase())
+            val specificJava = File(slotDir, "bin/java").takeIf { it.isFile }
+            val isSpecific = specificJava != null
+            val effectiveJava = specificJava ?: defaultJava
+            val isTarget = effectiveJava != null && (isSpecific || v == JdkVersion.JDK_17)
+            val home = effectiveJava?.parentFile?.parentFile
+                ?: if (isSpecific) slotDir else defaultRuntime
+            val markerApplies = verificationError != null &&
+                home.absolutePath == defaultRuntime.absolutePath
+            val verified = isTarget && !markerApplies &&
+                effectiveJava != null && effectiveJava.canExecute()
 
             JdkInstallation(
                 version = v,
-                homeDirectory = effectiveHome,
-                javaExecutable = effectiveJava,
+                homeDirectory = home,
+                javaExecutable = effectiveJava ?: File(home, "bin/java"),
                 isInstalled = isTarget,
-                isVerified = isTarget
+                isVerified = verified,
+                releaseString = verificationError.takeIf { markerApplies }
             )
         }
     }
@@ -67,7 +79,9 @@ class JdkManager(private val context: Context, private val runner: ToolProcessRu
     fun getActiveJdk(projectDir: File? = null): JdkInstallation {
         val selectedVersion = projectDir?.let { readProjectJdkPreference(it) } ?: JdkVersion.JDK_17
         val installations = listInstallations()
-        return installations.firstOrNull { it.version == selectedVersion && it.isInstalled }
+        return installations.firstOrNull { it.version == selectedVersion && it.isInstalled && it.isVerified }
+            ?: installations.firstOrNull { it.version == selectedVersion && it.isInstalled }
+            ?: installations.firstOrNull { it.isInstalled && it.isVerified }
             ?: installations.firstOrNull { it.isInstalled }
             ?: JdkInstallation(
                 version = JdkVersion.JDK_17,

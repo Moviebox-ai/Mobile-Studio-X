@@ -1,6 +1,8 @@
 package com.aaryo.mobilestudio.toolchain
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.security.KeyPair
@@ -45,7 +47,11 @@ class DirectCompilerEngine(
         keyAlias: String? = null,
         onLine: (String) -> Unit = {}
     ): Result<File> = runCatching {
-        build(projectDir, isRelease, keystoreFile, keystorePassword, keyAlias, onLine)
+        // Every stage below is blocking file/process work (resource copying, zip assembly,
+        // dex packaging). Running it on the caller's main-thread dispatcher froze the UI.
+        withContext(Dispatchers.IO) {
+            build(projectDir, isRelease, keystoreFile, keystorePassword, keyAlias, onLine)
+        }
     }
 
     private suspend fun build(
@@ -99,6 +105,35 @@ class DirectCompilerEngine(
         }
         onLine("  • toolchain: JDK ${toolchain.java?.parentFile?.parentFile?.name ?: "?"}, " +
             "build-tools ${toolchain.buildToolsVersion ?: "?"}, android.jar ${toolchain.androidJar?.name ?: "?"}")
+
+        // javac, kotlinc, D8 and apksigner all run inside the JVM. If the device's JVM cannot even
+        // print its version, every later step fails with a confusing tool error, so check it once
+        // here and explain the real cause.
+        val jvmProbe = runner.run(
+            listOf(toolchain.java!!.absolutePath, "-version"),
+            layout.moduleDir,
+            onLine = onLine,
+            timeoutMinutes = 1
+        )
+        val jvmText = jvmProbe.output.joinToString("\n")
+        if (jvmProbe.exitCode != 0) {
+            val tagged = jvmText.contains("Pointer tag for", true) || jvmText.contains("tagged-pointers", true)
+            error(
+                if (tagged) {
+                    "The on-device JVM cannot start on this device: Android aborted it with \"Pointer tag ... was truncated\" " +
+                        "(heap-tagging incompatibility, exit ${jvmProbe.exitCode}). javac, kotlinc, D8 and apksigner all need this JVM.\n" +
+                        "Fix: Tools > Toolchain > Download & install to reinstall JDK 17. If your device has Developer options > " +
+                        "Memory Tagging Extension / heap tagging, disable it and reinstall this app.\n" +
+                        "Raw JVM output:\n$jvmText"
+                } else {
+                    "The Android ARM64 JDK at ${toolchain.java?.absolutePath} cannot run (exit ${jvmProbe.exitCode}). " +
+                        "Reinstall JDK 17 from Tools > Toolchain.\nRaw JVM output:\n$jvmText"
+                }
+            )
+        }
+        if (!jvmText.contains("version", true) && !jvmText.contains("openjdk", true)) {
+            onLine("  • [WARN] 'java -version' printed no version banner; continuing anyway.")
+        }
 
         val workRoot = File(layout.moduleDir, "build/mobilestudio-direct").apply { cleanDirectory() }
         val genDir = File(workRoot, "gen").apply { requireMkdirs() }

@@ -48,9 +48,8 @@ data class AndroidToolchain(
         fun resolve(context: Context): AndroidToolchain = resolve(File(context.filesDir, "toolchain"))
 
         fun resolve(root: File): AndroidToolchain {
-            val javaHome = File(root, "runtime")
-            val java = File(javaHome, "bin/java").takeIf { it.isFile }
-            val javac = File(javaHome, "bin/javac").takeIf { it.isFile }
+            val java = findJava(root)
+            val javac = java?.parentFile?.resolve("javac")?.takeIf { it.isFile }
 
             val buildTools = newestVersionDirectory(File(root, "sdk/build-tools"))
             val platform = newestVersionDirectory(File(root, "sdk/platforms"))
@@ -93,6 +92,41 @@ data class AndroidToolchain(
                 kotlinStdlibJar = kotlinLibDir?.resolve("kotlin-stdlib.jar")?.takeIf { it.isFile },
                 buildToolsVersion = buildTools?.name
             )
+        }
+
+        /**
+         * Every plausible `java` executable inside the toolchain root, best candidate first.
+         *
+         * Installers have used `runtime/bin/java` and `jdk/<slot>/bin/java` over time, and an
+         * imported archive sometimes nests the runtime one level deeper. The inspector, the JDK
+         * manager and the Gradle engine must all agree on what "the JDK" is, otherwise the UI
+         * reports a JDK as missing while builds quietly use one (or the other way round).
+         */
+        fun javaCandidates(toolchainRoot: File): List<File> = buildList {
+            add(File(toolchainRoot, "runtime/bin/java"))
+            File(toolchainRoot, "jdk").listFiles().orEmpty()
+                .filter { it.isDirectory }
+                .sortedBy { it.name }
+                .forEach { add(File(it, "bin/java")) }
+            runCatching {
+                File(toolchainRoot, "runtime").walkTopDown().maxDepth(3)
+                    .filter { it.isFile && it.name == "java" && it.parentFile?.name == "bin" }
+                    .toList()
+            }.getOrDefault(emptyList()).sortedBy { it.absolutePath }.let { addAll(it) }
+        }.distinctBy { it.absolutePath }.filter { it.isFile }
+
+        fun findJava(toolchainRoot: File): File? = javaCandidates(toolchainRoot).firstOrNull()
+
+        /** Marker written by RuntimeInstaller when the JDK smoke test failed on this device. */
+        fun jdkVerificationMarker(toolchainRoot: File): File =
+            File(toolchainRoot, ".mobilestudio-jdk-verification-failed.txt")
+
+        fun jdkVerificationError(toolchainRoot: File): String? {
+            val marker = jdkVerificationMarker(toolchainRoot)
+            if (!marker.isFile) return null
+            val text = runCatching { marker.readText() }.getOrDefault("")
+            val detail = text.lines().firstOrNull { it.isNotBlank() && !it.startsWith("JDK verification failed") }
+            return (detail ?: "the installed JDK could not start on this device").trim()
         }
 
         /**

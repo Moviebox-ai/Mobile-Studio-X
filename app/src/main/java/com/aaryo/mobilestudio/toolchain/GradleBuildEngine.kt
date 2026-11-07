@@ -1,8 +1,17 @@
 package com.aaryo.mobilestudio.toolchain
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
-class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunner()) {
+class GradleBuildEngine(
+    private val runner: ToolProcessRunner = ToolProcessRunner(),
+    /**
+     * Optional file that remembers the JVM flag set that booted Gradle on this device, so every
+     * later build skips the (slow) bootstrap probing entirely.
+     */
+    var flagCacheFile: File? = null
+) {
 
     private companion object {
         /** AGP 9.1.1 requires Gradle 9.3.1 or newer. */
@@ -12,7 +21,7 @@ class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunne
     private fun launcherVersionForLog(name: String): String =
         Regex("^gradle-launcher-(.+)\\.jar$").matchEntire(name)?.groupValues?.get(1) ?: "unknown"
 
-    suspend fun run(context: BuildContext, onLine: (String) -> Unit): Result<File> = runCatching {
+    suspend fun run(context: BuildContext, onLine: (String) -> Unit): Result<File> = withContext(Dispatchers.IO) { runCatching {
         onLine("BUILD: Initializing Gradle build engine...")
         onLine("BUILD: Project: ${context.projectDir.absolutePath}")
         onLine("BUILD: Requested task: ${context.task}")
@@ -22,9 +31,19 @@ class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunne
             "Selected folder is not a Gradle project (settings.gradle[.kts] missing)."
         }
         onLine("BUILD: Validating project structure and Android ARM64 toolchain...")
-        val javaExecutable = File(context.runtimeDir, "bin/java")
-        require(javaExecutable.isFile && javaExecutable.canExecute()) {
-            "Android-host ARM64 JDK missing or not executable: $javaExecutable"
+        // Never trust a single hard-coded path: installs have landed in runtime/ and jdk/<slot>/.
+        val javaExecutable = File(context.runtimeDir, "bin/java").takeIf { it.isFile && it.canExecute() }
+            ?: AndroidToolchain.findJava(context.toolchainRoot)
+            ?: error(
+                "No Android ARM64 JDK found (looked for runtime/bin/java and jdk/*/bin/java under " +
+                    "${context.toolchainRoot.absolutePath}). Open Tools ▸ Toolchain and tap " +
+                    "\u201CDownload & install\u201D to install JDK 17 before building."
+            )
+        if (!javaExecutable.canExecute()) runCatching { javaExecutable.setExecutable(true, false) }
+        onLine("BUILD: Java runtime: ${javaExecutable.absolutePath}")
+        AndroidToolchain.jdkVerificationError(context.toolchainRoot)?.let { reason ->
+            onLine("BUILD: [WARN] This JDK failed its installation smoke test earlier: $reason")
+            onLine("BUILD: [WARN] Trying it anyway — if the JVM aborts, reinstall JDK 17 from Tools ▸ Toolchain.")
         }
         val lib = File(context.gradleDir, "lib")
         val launcher = lib.listFiles()?.firstOrNull {
@@ -190,9 +209,14 @@ class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunne
                 timeoutMinutes = 1
             )
         }
-        check(javaProbe.exitCode == 0 && javaProbe.output.any { it.contains("version", true) }) {
-            "The installed Android ARM64 Java runtime cannot start (exit ${javaProbe.exitCode}). " +
-                "Reinstall a Bionic-compatible ARM64 JDK 17. Output: ${javaProbe.output.takeLast(20).joinToString("\n")}"
+        val javaProbeText = javaProbe.output.joinToString("\n")
+        if (javaProbe.exitCode != 0) {
+            // This is where most broken devices land, and where the old code burned minutes in a
+            // retry ladder: a JVM that cannot even print its version will never boot Gradle.
+            error(jvmCannotBootMessage(javaProbe.exitCode, javaProbeText))
+        }
+        if (!javaProbeText.contains("version", ignoreCase = true) && !javaProbeText.contains("openjdk", ignoreCase = true)) {
+            onLine("BUILD: [WARN] 'java -version' printed no version banner; continuing with the installed runtime.")
         }
 
         // The same JVM flags are used for the bootstrap probe and the real build. Previously the
@@ -216,38 +240,96 @@ class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunne
             listOf(javaExecutable.absolutePath) + baseJvmFlags + extra +
                 listOf("-cp", classpath, "org.gradle.launcher.GradleMain") + args
 
-        // Android devices differ (page size, tagged pointers, CDS archive). Try progressively
-        // more conservative JVM flag sets and keep the first one that boots Gradle.
-        val flagLadder = listOf(
-            emptyList(),
-            listOf("-XX:-UseCompressedOops", "-XX:-UseCompressedClassPointers"),
-            listOf("-Xshare:off", "-XX:TieredStopAtLevel=1"),
-            listOf("-XX:-UseCompressedOops", "-XX:-UseCompressedClassPointers", "-Xshare:off", "-XX:TieredStopAtLevel=1"),
-            // Last resort: interpreter only. JIT-generated code is a common place where tagged
-            // pointers get truncated. Very slow, but better than a hard failure.
-            listOf("-XX:-UseCompressedOops", "-XX:-UseCompressedClassPointers", "-Xshare:off", "-Xint")
+        // Android devices differ (page size, tagged pointers, CDS archive), so a bootstrap probe is
+        // still the only reliable way to find a working flag set - but it has to be cheap. The old
+        // ladder tried five sets with a two minute timeout each, ending in interpreter-only (-Xint)
+        // mode. That froze the UI for many minutes and never helped: a JVM that aborts with
+        // "Pointer tag ... was truncated" dies for every flag set because the abort comes from the
+        // allocator, not from the JIT.
+        val cachedExtra = readCachedFlags()
+        val taggingSafe = listOf("-XX:-UseCompressedOops", "-XX:-UseCompressedClassPointers")
+        // Devices that abort with "Pointer tag ... was truncated" are often only *marginally*
+        // broken: the JVM starts, then dies while Gradle allocates. A much smaller heap and no
+        // tiered JIT keeps the native footprint low enough that boot can succeed.
+        val conservative = taggingSafe + listOf(
+            "-Xshare:off", "-XX:TieredStopAtLevel=1",
+            "-Xmx512m", "-Xss512k", "-XX:MaxMetaspaceSize=256m"
         )
-        onLine("BUILD: Starting Gradle JVM bootstrap checks. No project task has started yet.")
+        val flagLadder = buildList {
+            cachedExtra?.let { add(it) }
+            add(emptyList())
+            add(taggingSafe)
+            add(conservative)
+        }.distinct()
+
+        // The heap-tagging shim is our own hand-built ELF. If the device's linker rejects it the
+        // JVM can abort on its own, so the probe also runs once without LD_PRELOAD.
+        val probeEnvironments = listOf(
+            env,
+            env.toMutableMap().apply {
+                remove("LD_PRELOAD")
+                put("MO_SKIP_TAGFIX", "1")
+            }
+        )
+
+        onLine("BUILD: Starting Gradle JVM bootstrap check (at most ${flagLadder.size} flag sets, 60s each).")
         var chosenExtra: List<String>? = null
+        var chosenEnv: MutableMap<String, String> = env
         var lastProbe: ProcessResult? = null
-        for ((index, extra) in flagLadder.withIndex()) {
-            if (index > 0) onLine("Gradle bootstrap failed; retrying with JVM flags: ${extra.joinToString(" ")}")
-            if (extra.contains("-Xint")) onLine("WARNING: interpreter-only mode is very slow; the build may take a long time.")
-            onLine("BUILD: Gradle bootstrap attempt ${index + 1}/${flagLadder.size}...")
-            val probe = runner.run(gradleCommand(extra, listOf("--version")), context.projectDir, env, onLine, timeoutMinutes = 2)
-            lastProbe = probe
-            if (probe.exitCode == 0) { chosenExtra = extra; break }
+        var taggedAbort: String? = null
+        val probeDeadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(180)
+        probeLoop@ for ((envIndex, probeEnv) in probeEnvironments.withIndex()) {
+            if (envIndex > 0) onLine("BUILD: Retrying the JVM probe without the LD_PRELOAD compatibility shim...")
+            for (extra in flagLadder) {
+                if (System.nanoTime() > probeDeadline) {
+                    onLine("BUILD: JVM probing budget exhausted; stopping here.")
+                    break@probeLoop
+                }
+                val label = if (extra.isEmpty()) "default flags" else extra.joinToString(" ")
+                onLine("BUILD: Gradle JVM probe ($label)...")
+                val probe = runner.run(
+                    gradleCommand(extra, listOf("--version")),
+                    context.projectDir,
+                    probeEnv,
+                    onLine,
+                    timeoutMinutes = 1
+                )
+                lastProbe = probe
+                if (probe.exitCode == 0) {
+                    chosenExtra = extra
+                    chosenEnv = probeEnv
+                    break@probeLoop
+                }
+                val text = probe.output.joinToString("\n")
+                if (looksLikeTaggedPointerAbort(text)) {
+                    taggedAbort = text
+                    // The allocator, not the JIT, killed the JVM: only the most conservative flag
+                    // set is worth one more try, everything else is a guaranteed repeat.
+                    onLine("BUILD: JVM aborted with an Android heap-tagging error; trying the most conservative flags next.")
+                    continue
+                }
+                onLine("BUILD: JVM probe failed (exit ${probe.exitCode}).")
+            }
         }
+
         if (chosenExtra == null) {
-            val probe = lastProbe!!
             val fatal = collectFatalLogs(listOf(tmpDir, context.projectDir, context.projectDir.parentFile))
+            val details = lastProbe?.output?.takeLast(40)?.joinToString("\n").orEmpty()
             error(
-                "Gradle JVM bootstrap failed (exit ${probe.exitCode}) with all JVM flag sets. " +
-                    "This is before project compilation; verify the Android/Bionic JDK and Gradle distribution.\n" +
-                    probe.output.takeLast(60).joinToString("\n") +
-                    if (fatal.isNotBlank()) "\nJVM FATAL LOGS:\n$fatal" else "\nNo hs_err_pid log was produced."
+                if (taggedAbort != null) {
+                    jvmCannotBootMessage(lastProbe?.exitCode ?: -1, taggedAbort)
+                } else {
+                    "Gradle JVM bootstrap failed (exit ${lastProbe?.exitCode ?: -1}) before any project task ran. " +
+                        "The JDK or the Gradle distribution is unusable on this device.\n" +
+                        "Reinstall JDK 17 and Gradle 9.3.1 from Tools > Toolchain, then try again.\n" +
+                        details +
+                        if (fatal.isNotBlank()) "\nJVM FATAL LOGS:\n$fatal" else "\nNo hs_err_pid log was produced."
+                }
             )
         }
+
+        // Remember the working flag set (and whether the shim had to be dropped) for the next build.
+        writeCachedFlags(chosenExtra!!)
 
         val workingExtra: List<String> = chosenExtra!!
         // The forked build JVM reads org.gradle.jvmargs; give it the same working flags.
@@ -273,7 +355,7 @@ class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunne
                 listOf(context.task)
         )
         onLine("BUILD: Process started; waiting for Gradle task output...")
-        val result = runner.run(command, context.projectDir, env, onLine, timeoutMinutes = 60)
+        val result = runner.run(command, context.projectDir, chosenEnv, onLine, timeoutMinutes = 60)
         onLine("BUILD: Gradle process exited with code ${result.exitCode}.")
         if (result.exitCode != 0) {
             val fatal = collectFatalLogs(listOf(tmpDir, context.projectDir, context.projectDir.parentFile))
@@ -304,6 +386,47 @@ class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunne
         }
         artifact ?: File(context.projectDir, "app/build").also {
             check(it.isDirectory) { "Gradle exited successfully but expected app/build output is missing: ${result.output.takeLast(20).joinToString("\n")}" }
+        }
+    }
+    }
+
+    /**
+     * A JVM that cannot start is a device/toolchain problem, not a project problem. Say which one
+     * it is and stop - retrying flag sets is what made the app appear to hang.
+     */
+    private fun jvmCannotBootMessage(exitCode: Int, output: String): String {
+        val tail = output.lineSequence().filter { it.isNotBlank() }.toList().takeLast(20).joinToString("\n")
+        return if (looksLikeTaggedPointerAbort(output)) {
+            "The on-device JVM cannot start on this device: Android aborted it with \"Pointer tag ... was truncated\" " +
+                "(a heap-tagging incompatibility, exit $exitCode). The build stopped here instead of retrying JVM flag " +
+                "sets for minutes.\n" +
+                "What to do:\n" +
+                "  1. Tools > Toolchain > Download & install   (reinstalls the bundled Android ARM64 JDK 17)\n" +
+                "  2. If your device has Developer options > Memory Tagging Extension / heap tagging, disable it and reinstall this app\n" +
+                "  3. Build this project on a PC with Android Studio - the generated Gradle files are standard\n" +
+                "Raw JVM output:\n$tail"
+        } else {
+            "The installed Android ARM64 Java runtime cannot start (exit $exitCode), so no Gradle build can run.\n" +
+                "Reinstall JDK 17 from Tools > Toolchain (Download & install or Install local ZIP).\n" +
+                "Raw JVM output:\n$tail"
+        }
+    }
+
+    /** The allocator's own message - more flag sets cannot fix it. */
+    private fun looksLikeTaggedPointerAbort(text: String): Boolean =
+        text.contains("Pointer tag for", ignoreCase = true) || text.contains("tagged-pointers", ignoreCase = true)
+
+    private fun readCachedFlags(): List<String>? = runCatching {
+        val file = flagCacheFile ?: return null
+        if (!file.isFile) return null
+        val line = file.readText().trim()
+        if (line.isEmpty()) null else line.split(' ').filter { it.isNotBlank() }
+    }.getOrNull()
+
+    private fun writeCachedFlags(flags: List<String>) {
+        runCatching {
+            val file = flagCacheFile ?: return
+            file.writeText(flags.joinToString(" "))
         }
     }
 

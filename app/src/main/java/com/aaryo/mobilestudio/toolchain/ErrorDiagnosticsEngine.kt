@@ -83,12 +83,18 @@ object ErrorDiagnosticsEngine {
             val relevant = logs.filter { it.contains("pointer", true) || it.contains("SIGABRT", true) || it.contains("134") }
             return BuildDiagnostic(
                 category = ErrorCategory.TAGGED_POINTER_SIGABRT,
-                title = "ARM64 Pointer Tagging Abort (SIGABRT 134)",
-                summary = "Android 11+ Bionic detected pointer address bit-shifting / truncation during JVM execution.",
-                filePath = "AndroidManifest.xml / gradle.properties",
+                title = "This device's JVM cannot boot Gradle (heap-tagging abort)",
+                summary = "Android aborted the Java process with \"Pointer tag ... was truncated\" before Gradle could start. " +
+                    "This is a JVM/device incompatibility, not a problem in your project, so the remaining JVM flag sets " +
+                    "were skipped instead of retrying for minutes.",
+                filePath = "toolchain/runtime/bin/java",
                 lineNumber = null,
-                rootCause = "The 64-bit JVM default Compressed OOPs shifts upper address bits, corrupting Android's Top Byte Ignore (TBI) heap tags.",
-                recommendedFix = "The app already opts out (allowNativeHeapPointerTagging=false, memtagMode=off) and retries safer JVM flags. Turn OFF Developer options > Memory Tagging Extension (MTE) if your phone has it, reinstall the app, and if it still fails install a newer tag-safe Android ARM64 JDK 17 via Tools > Local ZIP.",
+                rootCause = "The installed JDK strips Android's Top Byte Ignore (TBI) heap tags. Any JVM flag set fails the " +
+                    "same way, because the abort comes from the allocator, not from the JIT.",
+                recommendedFix = "1) Tools > Toolchain > Download & install to (re)install the bundled Android ARM64 JDK 17. " +
+                    "2) If your device offers Developer options > Memory Tagging Extension / heap tagging, turn it off and " +
+                    "reinstall this app. 3) Use Compiler Mode \"Direct\" for projects without library dependencies, or build " +
+                    "the same project on a PC with Android Studio.",
                 relevantLogs = relevant
             )
         }

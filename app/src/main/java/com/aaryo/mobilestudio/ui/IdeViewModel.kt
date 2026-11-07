@@ -37,16 +37,23 @@ import com.aaryo.mobilestudio.toolchain.DependencyManager
 import com.aaryo.mobilestudio.toolchain.DependencyReport
 import com.aaryo.mobilestudio.toolchain.ErrorDiagnosticsEngine
 import com.aaryo.mobilestudio.toolchain.BuildDiagnostic
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 class IdeViewModel(application: Application) : AndroidViewModel(application) {
     private val workspace = ProjectWorkspace(application)
     private val inspector = RuntimeInspector(application)
-    private val gradleEngine = GradleBuildEngine()
+    private val gradleEngine = GradleBuildEngine(
+        flagCacheFile = File(application.filesDir, "toolchain/.gradle-jvm-flags")
+    )
     private val installer = RuntimeInstaller(application)
     private val onlineDownloader = OnlineToolchainDownloader(application)
     private val nativeEngine = NativeBuildEngine()
@@ -75,14 +82,30 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
     private val _project = MutableStateFlow<File?>(workspace.listProjects().firstOrNull())
     val project: StateFlow<File?> = _project
     private val _logs = MutableStateFlow<List<String>>(listOf("Mobile Studio X initialized."))
+
+    /**
+     * Build output can be thousands of lines per minute. Publishing every single line to the
+     * StateFlow re-rendered the log pane on the main thread for each one and froze the app
+     * ("Mobile Studio X isn't responding"), so lines are queued and flushed in small batches.
+     */
+    private val logQueue = Channel<String>(capacity = 4096, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     val logs: StateFlow<List<String>> = _logs
     private val _state = MutableStateFlow<BuildState>(BuildState.Idle)
     val state: StateFlow<BuildState> = _state
-    private val _runtime = MutableStateFlow(inspector.inspect())
+    private val _runtime = MutableStateFlow(RuntimeStatus())
     private val _downloadProgress = MutableStateFlow<DownloadProgress?>(null)
     val downloadProgress: StateFlow<DownloadProgress?> = _downloadProgress
     val runtime: StateFlow<RuntimeStatus> = _runtime
-    private val _sdkReport = MutableStateFlow(sdkInventory.inspect())
+    private val _sdkReport = MutableStateFlow(
+        SdkInventoryReport(
+            sdkRoot = File(application.filesDir, "toolchain/sdk"),
+            packages = emptyList(),
+            platforms = emptyList(),
+            buildTools = emptyList(),
+            commandLineTools = emptyList(),
+            platformTools = false
+        )
+    )
     val sdkReport: StateFlow<SdkInventoryReport> = _sdkReport
     private val _projectReport = MutableStateFlow<ProjectBuildReport?>(null)
     val projectReport: StateFlow<ProjectBuildReport?> = _projectReport
@@ -108,25 +131,41 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
     val activeJdk: StateFlow<JdkInstallation> = _activeJdk
 
     init {
+        startLogCollector()
         ensureToolchainPermissions()
         seedInitialProjectIfEmpty()
+        // Inventory the toolchain off the main thread: this walks the SDK, CMake and NDK trees
+        // and used to block the first frame (a frequent source of startup ANRs).
+        viewModelScope.launch(Dispatchers.IO) { refreshRuntime(discardLog = true) }
+    }
+
+    private fun startLogCollector() {
+        viewModelScope.launch {
+            val batch = ArrayList<String>(256)
+            while (true) {
+                batch.add(logQueue.receive())
+                while (batch.size < 1000) batch.add(logQueue.tryReceive().getOrNull() ?: break)
+                _logs.value = (_logs.value + batch).takeLast(500)
+                batch.clear()
+                delay(120)
+            }
+        }
     }
 
     private fun seedInitialProjectIfEmpty() {
-        if (workspace.listProjects().isEmpty()) {
-            viewModelScope.launch {
-                runCatching {
-                    val starter = workspace.createFromTemplate(
-                        type = TemplateType.COMPOSE,
-                        rawName = "MobileStudioApp",
-                        rawPackage = "com.mobilestudio.demo"
-                    )
-                    _project.value = starter
-                    refreshProjects()
-                    append("Created starter project 'MobileStudioApp' (Compose + Material 3).")
-                }.onFailure {
-                    append("Starter project initialization notice: ${it.message}")
-                }
+        viewModelScope.launch(Dispatchers.IO) {
+            if (workspace.listProjects().isNotEmpty()) return@launch
+            runCatching {
+                val starter = workspace.createFromTemplate(
+                    type = TemplateType.COMPOSE,
+                    rawName = "MobileStudioApp",
+                    rawPackage = "com.mobilestudio.demo"
+                )
+                _project.value = starter
+                refreshProjects()
+                append("Created starter project 'MobileStudioApp' (Compose + Material 3).")
+            }.onFailure {
+                append("Starter project initialization notice: ${it.message}")
             }
         }
     }
@@ -148,7 +187,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
         runCatching { workspace.setPublicStorageTree(uri) }
             .onSuccess {
                 append("Shared project storage connected: ${workspace.publicStorageLabel()}")
-                viewModelScope.launch {
+                viewModelScope.launch(Dispatchers.IO) {
                     workspace.listProjects().forEach { dir ->
                         runCatching { workspace.syncProjectToPublicStorage(dir) }
                     }
@@ -160,7 +199,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
 
     fun syncActiveProjectToPublicStorage() {
         val active = _project.value ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             runCatching { workspace.syncProjectToPublicStorage(active) }
                 .onSuccess { append(if (it) "Project synchronized to shared Internal Storage." else "Shared storage is not connected; project remains in private workspace.") }
                 .onFailure { append("Project sync failed: ${it.message}") }
@@ -199,7 +238,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun createProjectFromTemplate(type: TemplateType, name: String, packageName: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             append("Creating project '$name' from ${type.title} template...")
             runCatching {
                 workspace.createFromTemplate(type, name, packageName)
@@ -215,7 +254,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
 
     fun importProject(uri: Uri) {
         retainReadPermission(uri)
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             append("Importing project into private workspace...")
             runCatching { workspace.importTree(uri) }
                 .onSuccess {
@@ -229,7 +268,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
 
     fun importProjectZip(uri: Uri) {
         retainReadPermission(uri)
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             append("Importing project from ZIP archive...")
             runCatching { workspace.importZip(uri) }
                 .onSuccess {
@@ -243,7 +282,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
 
     fun installRuntime(uri: Uri) {
         retainReadPermission(uri)
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             append("Installing selected toolchain archive...")
             runCatching { installer.installFromZip(uri) }
                 .onSuccess {
@@ -263,7 +302,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
             append("Another operation is already running.")
             return
         }
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             _state.value = BuildState.Running("Download and install toolchain")
             _downloadProgress.value = DownloadProgress(0L, null, "Preparing downloads...")
             append("Starting one-tap toolchain download (JDK, Gradle, Build Tools, Platform)...")
@@ -300,7 +339,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
             append("Cannot verify toolchains while another operation is running.")
             return
         }
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             _state.value = BuildState.Running("Verify installed toolchains")
             append("=== TOOLCHAIN VERIFICATION STARTED ===")
             runCatching { toolchainVerifier.verify() }
@@ -323,10 +362,26 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshRuntime() {
+        viewModelScope.launch(Dispatchers.IO) { refreshRuntime(discardLog = false) }
+    }
+
+    /**
+     * Re-inventories the toolchain and, importantly, the JDK installs. The JDK flows used to be
+     * captured once when the ViewModel was created, so a JDK installed afterwards still showed up
+     * as "Missing" in the Toolchains & Runtime card while builds were already using it.
+     */
+    private fun refreshRuntime(discardLog: Boolean) = withContext(Dispatchers.IO) {
         ensureToolchainPermissions()
-        _runtime.value = inspector.inspect()
+        val status = inspector.inspect()
+        _runtime.value = status
         _sdkReport.value = sdkInventory.inspect()
-        append("Runtime and Android SDK inventory refreshed.")
+        _jdkInstallations.value = jdkManager.listInstallations()
+        _activeJdk.value = jdkManager.getActiveJdk(_project.value)
+        if (!discardLog) append("Runtime and Android SDK inventory refreshed.")
+        if (status.javaVerificationFailed) {
+            append("JDK: installed but its startup test failed (${status.javaIssue ?: "unknown reason"}).")
+            append("JDK: reinstall JDK 17 from Tools ▸ Toolchain, or build with the direct compiler.")
+        }
     }
 
     fun inspectProject() {
@@ -397,6 +452,11 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (_compilerMode.value == CompilerMode.GRADLE && !status.readyForGradle) {
                 append("BUILD: Gradle toolchain is not installed yet — using the direct on-device compiler.")
+                append("BUILD: Missing: ${if (status.javaExecutable == null) "JDK 17 " else ""}${if (status.gradleLauncher == null) "Gradle distribution" else ""}".trim())
+            }
+            if (status.javaVerificationFailed) {
+                append("BUILD: JDK startup test failed during installation (${status.javaIssue ?: "unknown reason"}).")
+                append("BUILD: Reinstall JDK 17 from Tools ▸ Toolchain before building anything that needs the JVM.")
             }
             if (!status.readyForAapt2 || status.d8 == null) {
                 append(
@@ -409,20 +469,27 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        // Re-resolve the JDK right before building: the cached flow could point at a runtime that
+        // has been reinstalled (or at the "not installed" fallback) since the app started.
+        _activeJdk.value = jdkManager.getActiveJdk(projectDir)
+        _jdkInstallations.value = jdkManager.listInstallations()
         val selectedJdk = _activeJdk.value
         val startTime = System.currentTimeMillis()
         _activeDiagnostic.value = null
 
-        // Auto-sanitize project before build to guarantee tagged pointer protections are active
-        workspace.sanitizeProjectForAndroidHost(projectDir)
-
         val runLogs = mutableListOf<String>()
         append("BUILD: Queued '$task' on Gradle Engine. Preparing project and toolchain...")
-        currentBuildJob = viewModelScope.launch {
+        currentBuildJob = viewModelScope.launch(Dispatchers.IO) {
             _state.value = BuildState.Running(task)
+            // Auto-sanitize the project (manifest/gradle.properties) before Gradle reads it. This
+            // writes files, so it must not run on the main thread.
+            runCatching { workspace.sanitizeProjectForAndroidHost(projectDir) }
             append("BUILD: Build session started.")
             append("BUILD: Project directory: ${projectDir.absolutePath}")
-            append("BUILD: Runtime: JDK ${selectedJdk.version.majorVersion}")
+            append("BUILD: Runtime: JDK ${selectedJdk.version.majorVersion} (${selectedJdk.javaExecutable.absolutePath})")
+            if (!selectedJdk.isVerified) {
+                append("BUILD: [WARN] This JDK is not verified on this device — if the JVM aborts, reinstall JDK 17 from Tools ▸ Toolchain.")
+            }
             append("BUILD: Gradle task: $task")
             append("BUILD: Initializing build process; bootstrap diagnostics will appear below.")
             val context = BuildContext(
@@ -512,7 +579,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
         val projectDir = _project.value ?: run { append("Select/import a project first."); return }
         val startTime = System.currentTimeMillis()
         _activeDiagnostic.value = null
-        currentBuildJob = viewModelScope.launch {
+        currentBuildJob = viewModelScope.launch(Dispatchers.IO) {
             val taskLabel = if (isRelease) "assembleRelease (Direct)" else "assembleDebug (Direct)"
             _state.value = BuildState.Running(taskLabel)
             if (isRelease) {
@@ -572,7 +639,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
 
     fun autoFixDiagnostic() {
         val projectDir = _project.value ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             workspace.sanitizeProjectForAndroidHost(projectDir)
             append("AUTO-FIX APPLIED: Configured android:allowNativeHeapPointerTagging=\"false\" and -XX:-UseCompressedOops.")
             _activeDiagnostic.value = null
@@ -593,7 +660,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
 
     fun cleanProject() {
         val projectDir = _project.value ?: run { append("Select a project first."); return }
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             _state.value = BuildState.Running("clean")
             append("CLEAN: Cleaning build artifacts and cache...")
             val buildDirs = projectDir.walkTopDown().filter { it.isDirectory && it.name == "build" }.toList()
@@ -614,7 +681,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
             runGradleTask("testDebugUnitTest")
             return
         }
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             _state.value = BuildState.Running("Unit Tests")
             append("TEST: Scanning unit test files in project...")
             val testFiles = projectDir.walkTopDown().filter { it.isFile && (it.name.endsWith("Test.kt") || it.name.endsWith("Test.java")) }.toList()
@@ -644,7 +711,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
             runGradleTask("lint")
             return
         }
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             _state.value = BuildState.Running("Lint Analysis")
             append("LINT: Running static code and resource analysis...")
             val issues = mutableListOf<String>()
@@ -699,7 +766,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun createKeystore(name: String, alias: String, pass: String, onDone: (Boolean) -> Unit) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             apkSigningEngine.createKeystore(name, alias, pass)
                 .onSuccess {
                     _keystores.value = apkSigningEngine.listSavedKeystores()
@@ -735,7 +802,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
             append("Standalone AAPT2 expects app/src/main/res and app/src/main/AndroidManifest.xml.")
             return
         }
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             _state.value = BuildState.Running("AAPT2 compile + link")
             val outputDir = File(projectDir, "build/standalone-aapt2").apply { mkdirs() }
             val toolchain = File(getApplication<Application>().filesDir, "toolchain")
@@ -790,7 +857,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
             append("Import a native project first.")
             return
         }
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             _state.value = BuildState.Running("CMake arm64-v8a")
             append("Starting standalone NDK/CMake build for arm64-v8a...")
             val toolchain = File(getApplication<Application>().filesDir, "toolchain")
@@ -840,6 +907,6 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun append(line: String) {
-        _logs.value = (_logs.value + line).takeLast(500)
+        logQueue.trySend(line)
     }
 }

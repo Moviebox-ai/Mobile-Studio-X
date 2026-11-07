@@ -87,6 +87,31 @@ is non-null.
 * “Failed to find Build Tools revision X” — tells you to install it or pin `buildToolsVersion`.
 * Incomplete on-device toolchain — lists the missing tools and points at the Toolchain screen.
 
+## Troubleshooting: "Mobile Studio X isn't responding" / stuck on "Gradle bootstrap"
+
+Those two symptoms came from the app itself, and both are fixed:
+
+* **Frozen UI.** Build orchestration, the log pane and the startup toolchain inventory ran on the
+  main thread, and every single line of Gradle output published a new StateFlow value (one
+  recomposition per line). Builds now run on `Dispatchers.IO`, startup inventory is off the main
+  thread, and log lines are queued and flushed in batches (~every 120 ms, last 500 lines).
+* **Endless JVM retries.** The Gradle engine used to try five JVM flag sets, two minutes each,
+  ending in interpreter-only (`-Xint`) mode — up to ten minutes of doing nothing. Now it runs at
+  most three sets (default → tagging-safe → conservative 512 MB/no-tiered-JIT), 60 s each with a
+  180 s budget, skips straight to the working set on later builds (cached in
+  `toolchain/.gradle-jvm-flags`) and stops immediately when the JVM itself aborts.
+
+If the log shows `Pointer tag for 0x... was truncated`, the device's Java runtime cannot run the
+JVM: that is a heap-tagging incompatibility, not a project error. What to do:
+
+1. Tools ▸ Toolchain ▸ **Download & install** to reinstall the bundled ARM64 JDK 17.
+2. If the device offers *Developer options ▸ Memory Tagging Extension / heap tagging*, disable it
+   and reinstall the app.
+3. Build the same project on a PC with Android Studio — the generated Gradle files are standard.
+
+The Toolchain card also tells a **broken** JDK apart from a **missing** one: `Installed, but the
+startup test failed` plus the raw reason, instead of the old, misleading "Missing".
+
 ## Tests
 
 `app/src/test/java/com/aaryo/mobilestudio/MobileStudioUnitTest.kt` covers:

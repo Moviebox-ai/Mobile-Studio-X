@@ -4,6 +4,10 @@ import android.app.Application
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.aaryo.mobilestudio.data.ProjectWorkspace
+import com.aaryo.mobilestudio.toolchain.ErrorDiagnosticsEngine
+import com.aaryo.mobilestudio.toolchain.JdkManager
+import com.aaryo.mobilestudio.toolchain.RuntimeInspector
+import com.aaryo.mobilestudio.toolchain.RuntimeStatus
 import com.aaryo.mobilestudio.toolchain.ToolchainCatalog
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -377,5 +381,83 @@ class MobileStudioUnitTest {
         assertNotNull(diagnostic)
         assertEquals(com.aaryo.mobilestudio.toolchain.ErrorCategory.TAGGED_POINTER_SIGABRT, diagnostic.category)
         assertTrue(diagnostic.title.contains("Linker", ignoreCase = true))
+    }
+    // ---------------------------------------------------------------- JDK discovery
+
+    private fun installFakeJdk(root: File, relativeJava: String) {
+        val java = File(root, relativeJava)
+        java.parentFile?.mkdirs()
+        java.writeText("#!/bin/bash\nexit 0\n")
+        java.setExecutable(true)
+    }
+
+    @Test
+    fun runtimeStatusDefaultsToNotReady() {
+        val status = RuntimeStatus()
+        assertFalse(status.readyForGradle)
+        assertFalse(status.readyForDirectBuild)
+        assertEquals("Not installed", status.javaSummary)
+    }
+
+    @Test
+    fun jdkInSlotDirectoryIsReportedReady() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val toolchain = File(app.filesDir, "toolchain").apply { deleteRecursively(); mkdirs() }
+        File(toolchain, "gradle/lib").mkdirs()
+        File(toolchain, "gradle/lib/gradle-launcher-9.3.1.jar").writeText("jar")
+        // Installers have used runtime/bin/java *and* jdk/<slot>/bin/java. Both must be detected.
+        installFakeJdk(toolchain, "jdk/jdk_17/bin/java")
+
+        val status = RuntimeInspector(app).inspect()
+        assertNotNull("A JDK in jdk/<slot>/bin must be discovered", status.javaExecutable)
+        assertTrue("Gradle must be considered ready", status.readyForGradle)
+        assertFalse(status.javaVerificationFailed)
+
+        val active = JdkManager(app).getActiveJdk()
+        assertTrue(active.isInstalled)
+        assertTrue(active.isVerified)
+        assertEquals("jdk_17", active.homeDirectory.name)
+    }
+
+    @Test
+    fun failedJdkVerificationIsSurfacedInsteadOfReportedMissing() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val toolchain = File(app.filesDir, "toolchain").apply { deleteRecursively(); mkdirs() }
+        File(toolchain, "gradle/lib").mkdirs()
+        File(toolchain, "gradle/lib/gradle-launcher-9.3.1.jar").writeText("jar")
+        installFakeJdk(toolchain, "runtime/bin/java")
+        File(toolchain, ".mobilestudio-jdk-verification-failed.txt").writeText(
+            "JDK verification failed; this runtime was NOT activated.\n" +
+                "IOException: Pointer tag for 0x720ea570e0 was truncated\n"
+        )
+
+        val status = RuntimeInspector(app).inspect()
+        // The JDK is present but must never be advertised as build-ready ...
+        assertNotNull(status.javaExecutable)
+        assertTrue(status.javaVerificationFailed)
+        assertFalse(status.readyForGradle)
+        assertTrue("A reason must be shown to the user", (status.javaIssue ?: "").isNotBlank())
+        // ... and the UI must be able to tell it apart from "Missing".
+        assertEquals("Installed, but the startup test failed", status.javaSummary)
+
+        val active = JdkManager(app).getActiveJdk()
+        assertTrue(active.isInstalled)
+        assertFalse(active.isVerified)
+    }
+
+    @Test
+    fun heapTaggingAbortProducesActionableDiagnostics() {
+        val logs = listOf(
+            "BUILD: Checking Java runtime on-device...",
+            "Pointer tag for 0x720ea570e0 was truncated, see 'https://source.android.com/devices/tech/debug/tagged-pointers'.",
+            "The installed Android ARM64 Java runtime cannot start (exit 134)."
+        )
+        val diagnostic = ErrorDiagnosticsEngine.analyze(logs, null)
+        assertEquals(com.aaryo.mobilestudio.toolchain.ErrorCategory.TAGGED_POINTER_SIGABRT, diagnostic.category)
+        assertTrue(
+            "The fix must tell the user how to recover",
+            diagnostic.recommendedFix.contains("Toolchain", ignoreCase = true) &&
+                diagnostic.recommendedFix.contains("Memory Tagging", ignoreCase = true)
+        )
     }
 }
