@@ -178,15 +178,18 @@ class ApkSigningEngine(
         require(apkFile.isFile) { "APK file missing: ${apkFile.name}" }
         val apksignerJar = findApksignerJar()
         if (apksignerJar == null || !javaExe.isFile) {
+            // Never claim an APK is signed without checking. Fall back to the platform JAR
+            // verifier, which validates CERT.RSA, CERT.SF and every entry digest.
+            val jar = JarV1Verifier.verify(apkFile)
             return Result.success(
                 SigningVerificationResult(
-                    isSigned = true,
-                    v1Scheme = true,
-                    v2Scheme = true,
+                    isSigned = jar.isSigned,
+                    v1Scheme = jar.isSigned,
+                    v2Scheme = false,
                     v3Scheme = false,
                     v4Scheme = false,
-                    signers = listOf("Signed Android package"),
-                    details = "Signature present."
+                    signers = if (jar.signers.isEmpty()) listOf("No certificate found") else jar.signers,
+                    details = jar.details + " (apksigner not installed: v2/v3 schemes were not checked.)"
                 )
             )
         }

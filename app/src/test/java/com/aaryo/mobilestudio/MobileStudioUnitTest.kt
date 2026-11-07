@@ -4,9 +4,14 @@ import android.app.Application
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.aaryo.mobilestudio.data.ProjectWorkspace
+import com.aaryo.mobilestudio.toolchain.ErrorDiagnosticsEngine
+import com.aaryo.mobilestudio.toolchain.JdkManager
+import com.aaryo.mobilestudio.toolchain.RuntimeInspector
+import com.aaryo.mobilestudio.toolchain.RuntimeStatus
 import com.aaryo.mobilestudio.toolchain.ToolchainCatalog
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -24,7 +29,7 @@ class MobileStudioUnitTest {
     fun catalogHasComponents() {
         val components = ToolchainCatalog.components
         assertNotNull(components)
-        assertEquals(7, components.size)
+        assertEquals(8, components.size)
     }
 
     @Test
@@ -36,7 +41,9 @@ class MobileStudioUnitTest {
     @Test
     fun catalogCoversRequiredRoles() {
         val ids = ToolchainCatalog.components.map { it.id }.toSet()
-        val expected = setOf("jdk17", "gradle", "build-tools", "r8", "platform-36", "cmake-ninja", "ndk-r30")
+        val expected = setOf(
+            "jdk17", "gradle", "kotlin", "build-tools", "r8", "platform-36", "cmake-ninja", "ndk-r30"
+        )
         assertEquals(expected, ids)
     }
 
@@ -158,38 +165,138 @@ class MobileStudioUnitTest {
     }
 
     @Test
-    fun directCompilerBuildsRealSignedApk() {
+    fun directCompilerFailsWithActionableMessageWhenToolchainIsMissing() {
         runBlocking {
             val context = ApplicationProvider.getApplicationContext<Application>()
             val workspace = ProjectWorkspace(context)
 
             val project = workspace.createFromTemplate(
-                type = com.aaryo.mobilestudio.data.TemplateType.COMPOSE,
-                rawName = "CompileTestApp",
-                rawPackage = "com.test.compileapp"
+                type = com.aaryo.mobilestudio.data.TemplateType.MINIMAL_AAPT,
+                rawName = "NoToolchainApp",
+                rawPackage = "com.test.notoolchain"
             )
 
             val compiler = com.aaryo.mobilestudio.toolchain.DirectCompilerEngine(context)
             val logs = mutableListOf<String>()
             val result = compiler.compile(project, isRelease = false) { logs.add(it) }
 
-            assertTrue("Compilation should succeed: ${logs.joinToString("\n")}", result.isSuccess)
-            val apk = result.getOrThrow()
-            assertTrue("Generated APK should exist on disk", apk.isFile)
-            assertTrue("Generated APK should have non-zero size: ${apk.length()} bytes", apk.length() > 1024L)
-
-            val inspector = com.aaryo.mobilestudio.toolchain.ProjectBuildInspector()
-            val report = inspector.inspectApk(apk)
-            assertTrue("APK must have AndroidManifest.xml", report.hasManifest)
-            assertTrue("APK must have classes.dex", report.dexFiles.contains("classes.dex"))
-            assertTrue("APK must have META-INF cryptographic signature", report.hasSignatureMetadata)
-
-            val signingEngine = com.aaryo.mobilestudio.toolchain.ApkSigningEngine(context)
-            val sigResult = signingEngine.verifyApkSignature(apk).getOrThrow()
-            assertTrue("APK must be signed", sigResult.isSigned)
-            assertTrue("APK must have V1 signature scheme", sigResult.v1Scheme)
+            // Previously this build "succeeded" and produced an APK that Android refused to
+            // install (raw XML manifest, fabricated resources.arsc and dex). It must now fail
+            // loudly and explain what to install.
+            assertTrue("Compilation without a toolchain must fail", result.isFailure)
+            val message = result.exceptionOrNull()?.message.orEmpty()
+            assertTrue("Diagnostic should list missing components: $message", message.contains("Missing components", true))
+            assertTrue("Diagnostic should point at the Toolchain screen: $message", message.contains("Toolchain", true))
+            assertTrue("Diagnostic should name AAPT2: $message", message.contains("AAPT2", true))
+            assertFalse(
+                "No APK may be produced when required tools are missing",
+                File(project, "app/build/outputs/apk/debug/app-debug.apk").exists()
+            )
 
             workspace.deleteProject(project)
+        }
+    }
+
+    @Test
+    fun generatedProjectsUsePluginVersionsCompatibleWithBundledGradle() {
+        runBlocking {
+            val context = ApplicationProvider.getApplicationContext<Application>()
+            val workspace = ProjectWorkspace(context)
+
+            val project = workspace.createFromTemplate(
+                type = com.aaryo.mobilestudio.data.TemplateType.COMPOSE,
+                rawName = "AgpCheckApp",
+                rawPackage = "com.test.agpcheck"
+            )
+
+            val rootScript = File(project, "build.gradle.kts").readText()
+            // The bundled distribution is Gradle 9.3.1; AGP 8.2.2 cannot run on it.
+            assertTrue("Root script must request AGP 9.1.1: $rootScript", rootScript.contains("version \"9.1.1\""))
+            assertTrue(
+                "Root script must declare the Compose compiler plugin: $rootScript",
+                rootScript.contains("org.jetbrains.kotlin.plugin.compose")
+            )
+            assertFalse(
+                "AGP 9 compiles Kotlin itself; the kotlin-android plugin must not be applied",
+                rootScript.contains("id(\"org.jetbrains.kotlin.android\")")
+            )
+
+            val appScript = File(project, "app/build.gradle.kts").readText()
+            assertTrue("app script must use buildToolsVersion 34.0.4: $appScript", appScript.contains("buildToolsVersion = \"34.0.4\""))
+            assertTrue("app script must compile against SDK 36: $appScript", appScript.contains("compileSdk = 36"))
+            assertFalse("app script must not apply kotlin-android", appScript.contains("org.jetbrains.kotlin.android"))
+            assertFalse("composeOptions is obsolete with Kotlin 2.x", appScript.contains("composeOptions"))
+            assertFalse("kotlinOptions is removed in AGP 9", appScript.contains("kotlinOptions"))
+            assertTrue(
+                "Compose template must apply the Compose compiler plugin",
+                appScript.contains("org.jetbrains.kotlin.plugin.compose")
+            )
+
+            workspace.deleteProject(project)
+        }
+    }
+
+    @Test
+    fun jarV1SignerProducesSignatureThatVerifies() {
+        runBlocking {
+            val context = ApplicationProvider.getApplicationContext<Application>()
+            val dir = File(context.cacheDir, "jar-v1-test").apply { mkdirs() }
+
+            val unsigned = File(dir, "unsigned.apk")
+            ZipOutputStream(FileOutputStream(unsigned)).use { zos ->
+                zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
+                zos.write(ByteArray(64) { 7 })
+                zos.closeEntry()
+                zos.putNextEntry(ZipEntry("classes.dex"))
+                zos.write(ByteArray(2048) { 3 })
+                zos.closeEntry()
+                zos.putNextEntry(ZipEntry("res/layout/activity_main.xml"))
+                zos.write("<LinearLayout/>".toByteArray())
+                zos.closeEntry()
+            }
+
+            val signingEngine = com.aaryo.mobilestudio.toolchain.ApkSigningEngine(context)
+            val keystore = signingEngine.createKeystore(
+                name = "jar_sign_test",
+                alias = "testalias",
+                password = "testpassword123"
+            ).getOrThrow()
+            val keyStore = java.security.KeyStore.getInstance("PKCS12").apply {
+                keystore.inputStream().use { load(it, "testpassword123".toCharArray()) }
+            }
+            val privateKey = keyStore.getKey("testalias", "testpassword123".toCharArray()) as java.security.PrivateKey
+            val certificate = keyStore.getCertificate("testalias") as java.security.cert.X509Certificate
+
+            val signed = com.aaryo.mobilestudio.toolchain.JarV1Signer.sign(
+                unsigned, File(dir, "signed.apk"), privateKey, certificate
+            )
+            val verification = com.aaryo.mobilestudio.toolchain.JarV1Verifier.verify(signed)
+            assertTrue("V1 signature must verify: ${verification.details}", verification.isSigned)
+            assertEquals(3, verification.signedEntries)
+            assertTrue(verification.unsignedEntries.isEmpty())
+
+            // A tampered entry must invalidate the signature.
+            val tampered = File(dir, "tampered.apk")
+            java.util.zip.ZipFile(signed).use { source ->
+                ZipOutputStream(FileOutputStream(tampered)).use { zos ->
+                    for (entry in source.entries()) {
+                        zos.putNextEntry(ZipEntry(entry.name))
+                        val bytes = source.getInputStream(entry).readBytes()
+                        if (entry.name == "classes.dex") bytes[0] = (bytes[0] + 1).toByte()
+                        zos.write(bytes)
+                        zos.closeEntry()
+                    }
+                }
+            }
+            assertFalse(
+                "A modified entry must fail V1 verification",
+                com.aaryo.mobilestudio.toolchain.JarV1Verifier.verify(tampered).isSigned
+            )
+
+            signed.delete()
+            tampered.delete()
+            unsigned.delete()
+            keystore.delete()
         }
     }
 
@@ -219,90 +326,6 @@ class MobileStudioUnitTest {
             assertTrue("Fingerprint should be non-empty", details.firstCertFingerprintSha256!!.isNotBlank())
 
             ksFile.delete()
-        }
-    }
-
-    @Test
-    fun realProjectCreationAndApkBuildVerification() {
-        runBlocking {
-            val context = ApplicationProvider.getApplicationContext<Application>()
-            val workspace = ProjectWorkspace(context)
-
-            // 1. Create a real Compose project
-            val projectName = "RealMobileApp"
-            val packageName = "com.aaryo.realapp"
-            val project = workspace.createFromTemplate(
-                type = com.aaryo.mobilestudio.data.TemplateType.COMPOSE,
-                rawName = projectName,
-                rawPackage = packageName
-            )
-
-            assertTrue("Project folder should exist", project.exists() && project.isDirectory)
-            val manifestFile = File(project, "app/src/main/AndroidManifest.xml")
-            val gradleFile = File(project, "app/build.gradle.kts")
-            val ktFile = File(project, "app/src/main/java/com/aaryo/realapp/MainActivity.kt")
-            assertTrue("AndroidManifest.xml must exist", manifestFile.exists())
-            assertTrue("app/build.gradle.kts must exist", gradleFile.exists())
-            assertTrue("MainActivity.kt must exist", ktFile.exists())
-
-            // 2. Execute Real Direct Compilation Engine
-            val compiler = com.aaryo.mobilestudio.toolchain.DirectCompilerEngine(context)
-            val buildLogs = mutableListOf<String>()
-            val buildResult = compiler.compile(project, isRelease = false) { log ->
-                buildLogs.add(log)
-            }
-
-            assertTrue("Real compilation must succeed without errors: ${buildLogs.joinToString("\n")}", buildResult.isSuccess)
-            val apk = buildResult.getOrThrow()
-            assertTrue("Output APK file must exist on disk", apk.isFile)
-            assertTrue("Output APK must have non-zero size (> 1KB)", apk.length() > 1024L)
-
-            // 3. Inspect and verify internal contents of the generated APK
-            java.util.zip.ZipFile(apk).use { zip ->
-                val manifestEntry = zip.getEntry("AndroidManifest.xml")
-                assertNotNull("APK must contain AndroidManifest.xml", manifestEntry)
-
-                val dexEntry = zip.getEntry("classes.dex")
-                assertNotNull("APK must contain classes.dex", dexEntry)
-
-                val arscEntry = zip.getEntry("resources.arsc")
-                assertNotNull("APK must contain resources.arsc", arscEntry)
-
-                val certRsaEntry = zip.getEntry("META-INF/CERT.RSA")
-                assertNotNull("APK must contain signed RSA signature META-INF/CERT.RSA", certRsaEntry)
-
-                val certSfEntry = zip.getEntry("META-INF/CERT.SF")
-                assertNotNull("APK must contain signed manifest list META-INF/CERT.SF", certSfEntry)
-
-                val mfEntry = zip.getEntry("META-INF/MANIFEST.MF")
-                assertNotNull("APK must contain META-INF/MANIFEST.MF", mfEntry)
-
-                // Verify Dalvik Executable (DEX) header magic bytes: dex\n035\0
-                zip.getInputStream(dexEntry).use { dexIn ->
-                    val magic = ByteArray(8)
-                    val read = dexIn.read(magic)
-                    assertEquals("DEX header must be at least 8 bytes", 8, read)
-                    val expectedMagic = byteArrayOf('d'.code.toByte(), 'e'.code.toByte(), 'x'.code.toByte(), 0x0a, '0'.code.toByte(), '3'.code.toByte(), '5'.code.toByte(), 0x00)
-                    for (i in 0 until 8) {
-                        assertEquals("DEX header byte $i mismatch", expectedMagic[i], magic[i])
-                    }
-                }
-            }
-
-            // 4. Verify Cryptographic V1 Signature on APK
-            val signingEngine = com.aaryo.mobilestudio.toolchain.ApkSigningEngine(context)
-            val sigCheck = signingEngine.verifyApkSignature(apk).getOrThrow()
-            assertTrue("Generated APK must be cryptographically signed", sigCheck.isSigned)
-            assertTrue("Generated APK must have valid V1 Signature scheme", sigCheck.v1Scheme)
-
-            // 5. Build Release APK to verify Release pipeline
-            val releaseResult = compiler.compile(project, isRelease = true)
-            assertTrue("Release APK compilation must succeed", releaseResult.isSuccess)
-            val releaseApk = releaseResult.getOrThrow()
-            assertTrue("Release APK file must exist", releaseApk.isFile)
-            assertTrue("Release APK must be signed", signingEngine.verifyApkSignature(releaseApk).getOrThrow().isSigned)
-
-            workspace.deleteProject(project)
         }
     }
 
@@ -358,5 +381,83 @@ class MobileStudioUnitTest {
         assertNotNull(diagnostic)
         assertEquals(com.aaryo.mobilestudio.toolchain.ErrorCategory.TAGGED_POINTER_SIGABRT, diagnostic.category)
         assertTrue(diagnostic.title.contains("Linker", ignoreCase = true))
+    }
+    // ---------------------------------------------------------------- JDK discovery
+
+    private fun installFakeJdk(root: File, relativeJava: String) {
+        val java = File(root, relativeJava)
+        java.parentFile?.mkdirs()
+        java.writeText("#!/bin/bash\nexit 0\n")
+        java.setExecutable(true)
+    }
+
+    @Test
+    fun runtimeStatusDefaultsToNotReady() {
+        val status = RuntimeStatus()
+        assertFalse(status.readyForGradle)
+        assertFalse(status.readyForDirectBuild)
+        assertEquals("Not installed", status.javaSummary)
+    }
+
+    @Test
+    fun jdkInSlotDirectoryIsReportedReady() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val toolchain = File(app.filesDir, "toolchain").apply { deleteRecursively(); mkdirs() }
+        File(toolchain, "gradle/lib").mkdirs()
+        File(toolchain, "gradle/lib/gradle-launcher-9.3.1.jar").writeText("jar")
+        // Installers have used runtime/bin/java *and* jdk/<slot>/bin/java. Both must be detected.
+        installFakeJdk(toolchain, "jdk/jdk_17/bin/java")
+
+        val status = RuntimeInspector(app).inspect()
+        assertNotNull("A JDK in jdk/<slot>/bin must be discovered", status.javaExecutable)
+        assertTrue("Gradle must be considered ready", status.readyForGradle)
+        assertFalse(status.javaVerificationFailed)
+
+        val active = JdkManager(app).getActiveJdk()
+        assertTrue(active.isInstalled)
+        assertTrue(active.isVerified)
+        assertEquals("jdk_17", active.homeDirectory.name)
+    }
+
+    @Test
+    fun failedJdkVerificationIsSurfacedInsteadOfReportedMissing() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val toolchain = File(app.filesDir, "toolchain").apply { deleteRecursively(); mkdirs() }
+        File(toolchain, "gradle/lib").mkdirs()
+        File(toolchain, "gradle/lib/gradle-launcher-9.3.1.jar").writeText("jar")
+        installFakeJdk(toolchain, "runtime/bin/java")
+        File(toolchain, ".mobilestudio-jdk-verification-failed.txt").writeText(
+            "JDK verification failed; this runtime was NOT activated.\n" +
+                "IOException: Pointer tag for 0x720ea570e0 was truncated\n"
+        )
+
+        val status = RuntimeInspector(app).inspect()
+        // The JDK is present but must never be advertised as build-ready ...
+        assertNotNull(status.javaExecutable)
+        assertTrue(status.javaVerificationFailed)
+        assertFalse(status.readyForGradle)
+        assertTrue("A reason must be shown to the user", (status.javaIssue ?: "").isNotBlank())
+        // ... and the UI must be able to tell it apart from "Missing".
+        assertEquals("Installed, but the startup test failed", status.javaSummary)
+
+        val active = JdkManager(app).getActiveJdk()
+        assertTrue(active.isInstalled)
+        assertFalse(active.isVerified)
+    }
+
+    @Test
+    fun heapTaggingAbortProducesActionableDiagnostics() {
+        val logs = listOf(
+            "BUILD: Checking Java runtime on-device...",
+            "Pointer tag for 0x720ea570e0 was truncated, see 'https://source.android.com/devices/tech/debug/tagged-pointers'.",
+            "The installed Android ARM64 Java runtime cannot start (exit 134)."
+        )
+        val diagnostic = ErrorDiagnosticsEngine.analyze(logs, null)
+        assertEquals(com.aaryo.mobilestudio.toolchain.ErrorCategory.TAGGED_POINTER_SIGABRT, diagnostic.category)
+        assertTrue(
+            "The fix must tell the user how to recover",
+            diagnostic.recommendedFix.contains("Toolchain", ignoreCase = true) &&
+                diagnostic.recommendedFix.contains("Memory Tagging", ignoreCase = true)
+        )
     }
 }

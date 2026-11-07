@@ -23,7 +23,9 @@ sealed interface BuildState {
 }
 
 enum class CompilerMode(val displayName: String, val badge: String) {
-    DIRECT("Fast On-Device Compiler", "⚡ Direct"),
+    /** AAPT2 + kotlinc/javac + D8 + zipalign + apksigner, running entirely on the device. */
+    DIRECT("Direct On-Device Compiler (AAPT2 · kotlinc · D8 · apksigner)", "⚡ Direct"),
+    /** Full Gradle build; required for projects with Maven dependencies. */
     GRADLE("Gradle Daemon (ARM64)", "🐘 Gradle")
 }
 

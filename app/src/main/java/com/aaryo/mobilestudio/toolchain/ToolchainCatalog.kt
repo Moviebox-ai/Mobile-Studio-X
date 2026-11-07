@@ -42,6 +42,16 @@ object ToolchainCatalog {
     private const val ANDROIDIDE_TOOLS =
         "https://github.com/AndroidIDEOfficial/androidide-tools/releases/download"
 
+    /**
+     * Kotlin/JVM compiler used by the direct on-device compiler. The official distribution
+     * archive is `kotlinc/`-rooted, hence `stripComponents = 1`.
+     */
+    const val KOTLIN_COMPILER_2_2_10_URL: String =
+        "https://github.com/JetBrains/kotlin/releases/download/v2.2.10/kotlin-compiler-2.2.10.zip"
+    const val KOTLIN_COMPILER_2_2_10_SHA256: String =
+        "302d1d8e671e5c3207e6ed62ff11fb555462a628e22a1158254dcaaf7e7394bc"
+    const val KOTLIN_COMPILER_2_2_10_SIZE_BYTES: Long = 78_048_449L
+
     val components: List<ToolchainComponent> = listOf(
         ToolchainComponent(
             id = "jdk17",
@@ -62,6 +72,16 @@ object ToolchainCatalog {
             sizeBytes = GRADLE_9_3_1_SIZE_BYTES,
             stripComponents = 1,
             targetPath = "gradle"
+        ),
+        ToolchainComponent(
+            id = "kotlin",
+            title = "Kotlin Compiler 2.2.10 (kotlinc)",
+            url = KOTLIN_COMPILER_2_2_10_URL,
+            format = ArchiveFormat.ZIP,
+            sha256 = KOTLIN_COMPILER_2_2_10_SHA256,
+            sizeBytes = KOTLIN_COMPILER_2_2_10_SIZE_BYTES,
+            stripComponents = 1,
+            targetPath = "kotlin"
         ),
         ToolchainComponent(
             id = "build-tools",

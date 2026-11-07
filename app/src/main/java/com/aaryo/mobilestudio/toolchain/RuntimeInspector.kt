@@ -4,25 +4,59 @@ import android.content.Context
 import java.io.File
 
 data class RuntimeStatus(
-    val javaExecutable: File?, val gradleLauncher: File?, val aapt2: File?,
-    val d8: File?, val r8: File?, val apksigner: File?, val zipalign: File?,
-    val cmake: File?, val ninja: File?, val ndkToolchainFile: File?, val androidJar: File?
+    val javaExecutable: File? = null,
+    val gradleLauncher: File? = null,
+    val aapt2: File? = null,
+    val d8: File? = null,
+    val r8: File? = null,
+    val apksigner: File? = null,
+    val zipalign: File? = null,
+    val cmake: File? = null,
+    val ninja: File? = null,
+    val ndkToolchainFile: File? = null,
+    val androidJar: File? = null,
+    val kotlinCompiler: File? = null,
+    /**
+     * The JDK is on disk but its `java -version` smoke test failed during installation
+     * (`RuntimeInstaller` writes a marker so a broken runtime is never advertised as ready).
+     */
+    val javaVerificationFailed: Boolean = false,
+    /** Short description of why the JDK is not usable, for the UI and the build log. */
+    val javaIssue: String? = null
 ) {
-    val readyForGradle get() = javaExecutable?.let { it.isFile && it.canExecute() } == true && gradleLauncher?.isFile == true
+    private val javaReady: Boolean
+        get() = javaExecutable?.let { it.isFile && it.canExecute() } == true && !javaVerificationFailed
+
+    val readyForGradle get() = javaReady && gradleLauncher?.isFile == true
     val readyForAapt2 get() = aapt2?.isFile == true && androidJar?.isFile == true
-    val readyForStandaloneDex get() = javaExecutable?.isFile == true && (d8?.isFile == true || r8?.isFile == true) && androidJar?.isFile == true
+    val readyForStandaloneDex get() = javaReady && (d8?.isFile == true || r8?.isFile == true) && androidJar?.isFile == true
     val readyForNativeBuild get() = cmake?.isFile == true && ninja?.isFile == true && ndkToolchainFile?.isFile == true
+
+    /** The direct compiler needs a working JVM, AAPT2, D8, apksigner, zipalign and android.jar. */
+    val readyForDirectBuild get() = javaReady &&
+        aapt2?.isFile == true && androidJar?.isFile == true && d8?.isFile == true &&
+        apksigner?.isFile == true && zipalign?.isFile == true
+
+    /** One-line JDK state for the "Toolchains & Runtime" card. */
+    val javaSummary: String
+        get() = when {
+            javaVerificationFailed -> "Installed, but the startup test failed"
+            javaExecutable == null -> "Not installed"
+            javaExecutable.canExecute() -> javaExecutable.parentFile?.parentFile?.name ?: "ready"
+            else -> "Found, but not executable"
+        }
 }
 
 class RuntimeInspector(context: Context) {
     private val root = File(context.filesDir, "toolchain")
-    private val executableJava = File(context.filesDir, "toolchain/runtime/bin/java")
 
     fun inspect(): RuntimeStatus {
         // A previous installer version could mark a JDK as installed even when its
-        // java -version smoke test failed. Do not advertise that runtime as build-ready.
-        val failedVerification = File(root, ".mobilestudio-jdk-verification-failed.txt")
-        val java = executableJava.takeIf { it.isFile && !failedVerification.isFile }
+        // java -version smoke test failed. Do not advertise that runtime as build-ready,
+        // but do not hide it either: "Missing" is the wrong message for a JDK that is
+        // present and broken, because it sends people looking for a download they already have.
+        val verificationError = AndroidToolchain.jdkVerificationError(root)
+        val java = AndroidToolchain.findJava(root)
         val gradleLib = File(root, "gradle/lib")
         val launcher = gradleLib.listFiles()?.firstOrNull { it.name.startsWith("gradle-launcher-") && it.extension == "jar" }
         val buildTools = newest(File(root, "sdk/build-tools"))
@@ -64,16 +98,23 @@ class RuntimeInspector(context: Context) {
         ).firstOrNull { it?.isFile == true }
 
         return RuntimeStatus(
-            java, launcher,
-            buildTools?.resolve("aapt2")?.takeIf { it.isFile },
-            buildTools?.resolve("lib/d8.jar")?.takeIf { it.isFile },
-            r8File,
-            buildTools?.resolve("apksigner")?.takeIf { it.isFile },
-            buildTools?.resolve("zipalign")?.takeIf { it.isFile },
-            cmake,
-            ninja,
-            ndkToolchain,
-            platform?.resolve("android.jar")?.takeIf { it.isFile }
+            javaExecutable = java,
+            gradleLauncher = launcher,
+            aapt2 = buildTools?.resolve("aapt2")?.takeIf { it.isFile },
+            d8 = buildTools?.resolve("lib/d8.jar")?.takeIf { it.isFile },
+            r8 = r8File,
+            apksigner = buildTools?.resolve("apksigner")?.takeIf { it.isFile },
+            zipalign = buildTools?.resolve("zipalign")?.takeIf { it.isFile },
+            cmake = cmake,
+            ninja = ninja,
+            ndkToolchainFile = ndkToolchain,
+            androidJar = platform?.resolve("android.jar")?.takeIf { it.isFile },
+            kotlinCompiler = listOf(
+                File(root, "kotlin/lib/kotlin-compiler.jar"),
+                File(root, "kotlinc/lib/kotlin-compiler.jar")
+            ).firstOrNull { it.isFile },
+            javaVerificationFailed = verificationError != null,
+            javaIssue = verificationError
         )
     }
 

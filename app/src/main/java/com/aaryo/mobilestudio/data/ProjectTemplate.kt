@@ -81,9 +81,12 @@ object ProjectTemplateGenerator {
         // 2. Root build.gradle.kts
         File(targetDir, "build.gradle.kts").writeText(
             """
+            // Android Gradle Plugin 9.1.1 is the version that matches the bundled
+            // Gradle 9.3.1 distribution and Kotlin 2.2.10. AGP 9.x compiles Kotlin itself
+            // ("built-in Kotlin"), so org.jetbrains.kotlin.android must NOT be applied.
             plugins {
-                id("com.android.application") version "8.2.2" apply false
-                id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+                id("com.android.application") version "9.1.1" apply false
+                id("org.jetbrains.kotlin.plugin.compose") version "2.2.10" apply false
             }
             """.trimIndent() + "\n"
         )
@@ -164,12 +167,23 @@ object ProjectTemplateGenerator {
                     """
                     plugins {
                         id("com.android.application")
-                        id("org.jetbrains.kotlin.android")
+                        id("org.jetbrains.kotlin.plugin.compose")
                     }
 
                     android {
                         namespace = "$packageName"
-                        compileSdk = 34
+                        compileSdk = 36
+                        buildToolsVersion = "34.0.4"
+
+                        // Sign release builds with the debug key so "assembleRelease" also produces
+                        // an installable APK on the device. Replace with your own keystore before
+                        // publishing to a store.
+                        buildTypes {
+                            getByName("release") {
+                                isMinifyEnabled = false
+                                signingConfig = signingConfigs.getByName("debug")
+                            }
+                        }
 
                         defaultConfig {
                             applicationId = "$packageName"
@@ -182,15 +196,9 @@ object ProjectTemplateGenerator {
                         buildFeatures {
                             compose = true
                         }
-                        composeOptions {
-                            kotlinCompilerExtensionVersion = "1.5.8"
-                        }
                         compileOptions {
                             sourceCompatibility = JavaVersion.VERSION_17
                             targetCompatibility = JavaVersion.VERSION_17
-                        }
-                        kotlinOptions {
-                            jvmTarget = "17"
                         }
                     }
 
@@ -274,12 +282,22 @@ object ProjectTemplateGenerator {
                     """
                     plugins {
                         id("com.android.application")
-                        id("org.jetbrains.kotlin.android")
                     }
 
                     android {
                         namespace = "$packageName"
-                        compileSdk = 34
+                        compileSdk = 36
+                        buildToolsVersion = "34.0.4"
+
+                        // Sign release builds with the debug key so "assembleRelease" also produces
+                        // an installable APK on the device. Replace with your own keystore before
+                        // publishing to a store.
+                        buildTypes {
+                            getByName("release") {
+                                isMinifyEnabled = false
+                                signingConfig = signingConfigs.getByName("debug")
+                            }
+                        }
 
                         defaultConfig {
                             applicationId = "$packageName"
@@ -291,9 +309,6 @@ object ProjectTemplateGenerator {
                         compileOptions {
                             sourceCompatibility = JavaVersion.VERSION_17
                             targetCompatibility = JavaVersion.VERSION_17
-                        }
-                        kotlinOptions {
-                            jvmTarget = "17"
                         }
                     }
 
@@ -378,12 +393,22 @@ object ProjectTemplateGenerator {
                     """
                     plugins {
                         id("com.android.application")
-                        id("org.jetbrains.kotlin.android")
                     }
 
                     android {
                         namespace = "$packageName"
-                        compileSdk = 34
+                        compileSdk = 36
+                        buildToolsVersion = "34.0.4"
+
+                        // Sign release builds with the debug key so "assembleRelease" also produces
+                        // an installable APK on the device. Replace with your own keystore before
+                        // publishing to a store.
+                        buildTypes {
+                            getByName("release") {
+                                isMinifyEnabled = false
+                                signingConfig = signingConfigs.getByName("debug")
+                            }
+                        }
 
                         defaultConfig {
                             applicationId = "$packageName"
@@ -407,9 +432,6 @@ object ProjectTemplateGenerator {
                         compileOptions {
                             sourceCompatibility = JavaVersion.VERSION_17
                             targetCompatibility = JavaVersion.VERSION_17
-                        }
-                        kotlinOptions {
-                            jvmTarget = "17"
                         }
                     }
 
@@ -499,12 +521,22 @@ object ProjectTemplateGenerator {
                     """
                     plugins {
                         id("com.android.application")
-                        id("org.jetbrains.kotlin.android")
                     }
 
                     android {
                         namespace = "$packageName"
-                        compileSdk = 34
+                        compileSdk = 36
+                        buildToolsVersion = "34.0.4"
+
+                        // Sign release builds with the debug key so "assembleRelease" also produces
+                        // an installable APK on the device. Replace with your own keystore before
+                        // publishing to a store.
+                        buildTypes {
+                            getByName("release") {
+                                isMinifyEnabled = false
+                                signingConfig = signingConfigs.getByName("debug")
+                            }
+                        }
 
                         defaultConfig {
                             applicationId = "$packageName"

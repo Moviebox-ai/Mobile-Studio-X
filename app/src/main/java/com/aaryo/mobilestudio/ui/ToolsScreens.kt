@@ -99,6 +99,8 @@ fun ToolchainsScreen(
                         DsStatusRow("APK signer", runtime.apksigner?.name.orEmpty(), runtime.apksigner?.exists() == true)
                         DsStatusRow("Zipalign", runtime.zipalign?.name.orEmpty(), runtime.zipalign?.exists() == true)
                         DsStatusRow("android.jar", runtime.androidJar?.absolutePath.orEmpty(), runtime.androidJar?.isFile == true)
+                        DsStatusRow("Kotlin compiler (kotlinc)", runtime.kotlinCompiler?.absolutePath.orEmpty(), runtime.kotlinCompiler?.isFile == true)
+                        DsStatusRow("Ready for direct APK builds", "", runtime.readyForDirectBuild)
                         Text("Build Tools: ${sdkReport.buildTools.joinToString().ifBlank { "none" }}", color = Ds.Muted, fontSize = 11.sp)
                     }
                     DsButton("Install / Update SDK", Icons.Default.Download, onInstall, enabled = !busy)
@@ -122,7 +124,18 @@ fun ToolchainsScreen(
                 2 -> {
                     ToolHeader("Java Development Kit", "ARM64 JDK 17 used to run Gradle on the device.", Icons.Default.Coffee, runtime.javaExecutable?.isFile == true)
                     DsCard {
-                        DsStatusRow("ARM64 JDK", runtime.javaExecutable?.absolutePath.orEmpty(), runtime.javaExecutable?.isFile == true)
+                        DsStatusRow(
+                            "ARM64 JDK 17",
+                            runtime.javaExecutable?.absolutePath.orEmpty(),
+                            runtime.javaExecutable?.isFile == true && !runtime.javaVerificationFailed
+                        )
+                        if (runtime.javaVerificationFailed) {
+                            Text(
+                                "This JDK is installed but could not start (${runtime.javaIssue ?: "unknown reason"}). " +
+                                    "Tap 'Install / Update JDK' to reinstall it.",
+                                color = Ds.Orange, fontSize = 11.sp
+                            )
+                        }
                         DsStatusRow("Executable permission", "", runtime.javaExecutable?.canExecute() == true)
                     }
                     DsButton("Install / Update JDK", Icons.Default.Download, onInstall, enabled = !busy)

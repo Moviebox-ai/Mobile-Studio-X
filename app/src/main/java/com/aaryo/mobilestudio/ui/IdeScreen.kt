@@ -916,7 +916,7 @@ private fun BuildDashboardTab(
                 FilterChip(
                     selected = compilerMode == com.aaryo.mobilestudio.toolchain.CompilerMode.DIRECT,
                     onClick = { onSetCompilerMode(com.aaryo.mobilestudio.toolchain.CompilerMode.DIRECT) },
-                    label = { Text("⚡ Fast Direct (Built-in)", fontSize = 11.sp) },
+                    label = { Text("⚡ Direct (AAPT2 + D8)", fontSize = 11.sp) },
                     modifier = Modifier.weight(1f)
                 )
                 FilterChip(
@@ -994,8 +994,24 @@ private fun BuildDashboardTab(
         DsCard {
             Text("Toolchains & Runtime", color = Ds.OnBg, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
             DsStatusRow("Gradle Distribution", "Gradle ${gradleVersion ?: "9.3.1"}", runtime.gradleLauncher != null)
-            DsStatusRow("JDK Runtime", if (activeJdk.isInstalled) activeJdk.homeDirectory.name else "Embedded OpenJDK 17", activeJdk.isInstalled)
-            DsStatusRow("AAPT2 / D8 / apksigner", runtime.aapt2?.name ?: "Build Tools 35.0.0", runtime.aapt2?.exists() == true)
+            DsStatusRow(
+                "JDK Runtime",
+                if (activeJdk.isInstalled) {
+                    "JDK ${activeJdk.version.majorVersion} · ${activeJdk.homeDirectory.name}" +
+                        if (!activeJdk.isVerified) " (startup test failed)" else ""
+                } else {
+                    "Embedded OpenJDK 17"
+                },
+                activeJdk.isInstalled && activeJdk.isVerified
+            )
+            if (runtime.javaVerificationFailed) {
+                Text(
+                    "JDK: ${runtime.javaIssue ?: "the installed runtime could not start"}. " +
+                        "Reinstall JDK 17 from Tools ▸ Toolchain.",
+                    color = Ds.Orange, fontSize = 11.sp
+                )
+            }
+            DsStatusRow("AAPT2 / D8 / apksigner", runtime.aapt2?.name ?: "Build Tools 34.0.4", runtime.aapt2?.exists() == true)
         }
 
         // Project Configuration
