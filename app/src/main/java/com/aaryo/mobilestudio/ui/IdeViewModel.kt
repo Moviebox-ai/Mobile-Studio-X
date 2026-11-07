@@ -369,7 +369,18 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
         if (projectDir == null) { append("Select/import a project first."); return }
         val status = inspector.inspect()
 
-        val isDirectMode = _compilerMode.value == CompilerMode.DIRECT || !status.readyForGradle
+        // The direct compiler resolves no Maven artifacts: it compiles against android.jar, the
+        // Kotlin standard library and any jars in app/libs. Projects that declare library
+        // dependencies (Compose, AndroidX, Material, ...) must therefore go through Gradle.
+        val needsGradleForDependencies = status.readyForGradle && declaresMavenDependencies(projectDir)
+        if (needsGradleForDependencies && _compilerMode.value == CompilerMode.DIRECT) {
+            append(
+                "BUILD: '${projectDir.name}' declares Maven dependencies, which the direct compiler cannot " +
+                    "resolve. Using the Gradle engine for this build."
+            )
+        }
+        val isDirectMode = !status.readyForGradle ||
+            (_compilerMode.value == CompilerMode.DIRECT && !needsGradleForDependencies)
 
         if (isDirectMode) {
             if (task.contains("clean", true)) {
@@ -385,7 +396,14 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
             if (_compilerMode.value == CompilerMode.GRADLE && !status.readyForGradle) {
-                append("BUILD: Gradle toolchain not yet installed. Automatically using Direct On-Device Compiler...")
+                append("BUILD: Gradle toolchain is not installed yet — using the direct on-device compiler.")
+            }
+            if (!status.readyForAapt2 || status.d8 == null) {
+                append(
+                    "BUILD: The on-device toolchain is incomplete. The direct compiler needs AAPT2, D8, " +
+                        "zipalign, apksigner, android.jar, the Kotlin compiler and JDK 17 — open Tools ▸ " +
+                        "Toolchain and run 'Download & install'."
+                )
             }
             compileDirectly(isRelease = task.contains("release", true) || task.contains("bundle", true))
             return
@@ -473,6 +491,19 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** True when the module's build script pulls in remote (Maven) libraries. */
+    private fun declaresMavenDependencies(projectDir: File): Boolean {
+        val scripts = listOf(
+            File(projectDir, "app/build.gradle.kts"),
+            File(projectDir, "app/build.gradle")
+        ).filter { it.isFile }
+        return scripts.any { script ->
+            val text = runCatching { script.readText() }.getOrDefault("")
+            val dependenciesBlock = text.substringAfter("dependencies {", "").substringBeforeLast('}')
+            Regex("""implementation\s*\(?\s*["']""").containsMatchIn(dependenciesBlock)
+        }
+    }
+
     fun compileDirectly(isRelease: Boolean = false) {
         if (currentBuildJob?.isActive == true || _state.value is BuildState.Running) {
             append("BUILD: A build is already running. Wait for it to finish or cancel it first.")
@@ -484,6 +515,12 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
         currentBuildJob = viewModelScope.launch {
             val taskLabel = if (isRelease) "assembleRelease (Direct)" else "assembleDebug (Direct)"
             _state.value = BuildState.Running(taskLabel)
+            if (isRelease) {
+                append(
+                    "BUILD: Release APK will be signed with the Mobile Studio X debug key. Create a keystore " +
+                        "in Signing Manager and use the Gradle engine for a store-ready build."
+                )
+            }
             directCompiler.compile(
                 projectDir = projectDir,
                 isRelease = isRelease,
@@ -511,6 +548,9 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
                 _activeDiagnostic.value = diagnostic
                 _state.value = BuildState.Failed(err.message ?: "Direct compilation failed")
                 append("BUILD: Direct compilation failed: ${err.message}")
+                if (err.message?.contains("toolchain is incomplete", true) == true) {
+                    append("BUILD: Install the missing components from Tools ▸ Toolchain, then build again.")
+                }
                 buildHistoryManager.recordBuild(
                     BuildRecord(
                         id = "${System.currentTimeMillis()}",

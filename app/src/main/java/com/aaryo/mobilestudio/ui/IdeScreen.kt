@@ -916,7 +916,7 @@ private fun BuildDashboardTab(
                 FilterChip(
                     selected = compilerMode == com.aaryo.mobilestudio.toolchain.CompilerMode.DIRECT,
                     onClick = { onSetCompilerMode(com.aaryo.mobilestudio.toolchain.CompilerMode.DIRECT) },
-                    label = { Text("⚡ Fast Direct (Built-in)", fontSize = 11.sp) },
+                    label = { Text("⚡ Direct (AAPT2 + D8)", fontSize = 11.sp) },
                     modifier = Modifier.weight(1f)
                 )
                 FilterChip(

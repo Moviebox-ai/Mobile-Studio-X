@@ -72,6 +72,19 @@ class ToolchainVerifier(context: Context) {
         val zipalign = probe(File(buildTools, "zipalign"), "-h")
         result("Zipalign", zipalign.first, zipalign.second)
 
+        val kotlinCompiler = File(root, "kotlin/lib/kotlin-compiler.jar")
+        val kotlinCompilerOk = kotlinCompiler.isFile && runCatching {
+            ZipFile(kotlinCompiler).use { zip ->
+                zip.getEntry("org/jetbrains/kotlin/cli/jvm/K2JVMCompiler.class") != null
+            }
+        }.getOrDefault(false)
+        result(
+            "Kotlin compiler (kotlinc)",
+            kotlinCompilerOk,
+            if (kotlinCompilerOk) "kotlin-compiler.jar contains the K2 JVM compiler" else
+                "kotlin/lib/kotlin-compiler.jar missing — the direct compiler cannot build Kotlin sources"
+        )
+
         val androidJar = File(root, "sdk/platforms/android-36/android.jar")
         val platformOk = if (androidJar.isFile) runCatching {
             ZipFile(androidJar).use { zip -> zip.getEntry("android/Manifest.class") != null || zip.size() > 100 }

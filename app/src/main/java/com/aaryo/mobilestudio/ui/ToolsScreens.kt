@@ -99,6 +99,8 @@ fun ToolchainsScreen(
                         DsStatusRow("APK signer", runtime.apksigner?.name.orEmpty(), runtime.apksigner?.exists() == true)
                         DsStatusRow("Zipalign", runtime.zipalign?.name.orEmpty(), runtime.zipalign?.exists() == true)
                         DsStatusRow("android.jar", runtime.androidJar?.absolutePath.orEmpty(), runtime.androidJar?.isFile == true)
+                        DsStatusRow("Kotlin compiler (kotlinc)", runtime.kotlinCompiler?.absolutePath.orEmpty(), runtime.kotlinCompiler?.isFile == true)
+                        DsStatusRow("Ready for direct APK builds", "", runtime.readyForDirectBuild)
                         Text("Build Tools: ${sdkReport.buildTools.joinToString().ifBlank { "none" }}", color = Ds.Muted, fontSize = 11.sp)
                     }
                     DsButton("Install / Update SDK", Icons.Default.Download, onInstall, enabled = !busy)

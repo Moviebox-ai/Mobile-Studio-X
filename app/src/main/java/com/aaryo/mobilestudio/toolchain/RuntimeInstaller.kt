@@ -264,6 +264,7 @@ class RuntimeInstaller(private val context: Context) {
         add("Gradle distribution")
         add("Android SDK platform")
         add("Android Build Tools: AAPT2/D8/R8/apksigner/zipalign")
+        if (File(root, "kotlin/lib/kotlin-compiler.jar").isFile) add("Kotlin compiler (kotlinc)")
         if (File(root, "ndk").isDirectory) add("Android NDK toolchain")
         if (File(root, "cmake").isDirectory) add("CMake and Ninja build tools")
     }

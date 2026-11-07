@@ -6,12 +6,18 @@ import java.io.File
 data class RuntimeStatus(
     val javaExecutable: File?, val gradleLauncher: File?, val aapt2: File?,
     val d8: File?, val r8: File?, val apksigner: File?, val zipalign: File?,
-    val cmake: File?, val ninja: File?, val ndkToolchainFile: File?, val androidJar: File?
+    val cmake: File?, val ninja: File?, val ndkToolchainFile: File?, val androidJar: File?,
+    val kotlinCompiler: File? = null
 ) {
     val readyForGradle get() = javaExecutable?.let { it.isFile && it.canExecute() } == true && gradleLauncher?.isFile == true
     val readyForAapt2 get() = aapt2?.isFile == true && androidJar?.isFile == true
     val readyForStandaloneDex get() = javaExecutable?.isFile == true && (d8?.isFile == true || r8?.isFile == true) && androidJar?.isFile == true
     val readyForNativeBuild get() = cmake?.isFile == true && ninja?.isFile == true && ndkToolchainFile?.isFile == true
+
+    /** The direct compiler needs AAPT2, D8, apksigner, zipalign, android.jar and kotlinc. */
+    val readyForDirectBuild get() = javaExecutable?.let { it.isFile && it.canExecute() } == true &&
+        aapt2?.isFile == true && androidJar?.isFile == true && d8?.isFile == true &&
+        apksigner?.isFile == true && zipalign?.isFile == true
 }
 
 class RuntimeInspector(context: Context) {
@@ -73,7 +79,11 @@ class RuntimeInspector(context: Context) {
             cmake,
             ninja,
             ndkToolchain,
-            platform?.resolve("android.jar")?.takeIf { it.isFile }
+            platform?.resolve("android.jar")?.takeIf { it.isFile },
+            listOf(
+                File(root, "kotlin/lib/kotlin-compiler.jar"),
+                File(root, "kotlinc/lib/kotlin-compiler.jar")
+            ).firstOrNull { it.isFile }
         )
     }
 

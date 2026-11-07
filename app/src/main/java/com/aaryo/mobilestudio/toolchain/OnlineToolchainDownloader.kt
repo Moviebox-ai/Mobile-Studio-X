@@ -247,6 +247,8 @@ class OnlineToolchainDownloader(
             "jdk17" -> File(dir, "runtime/bin/java").isFile
             "gradle" -> File(dir, "gradle/lib").listFiles()?.any { it.name.startsWith("gradle-launcher-") && it.extension == "jar" } == true
             "build-tools" -> File(dir, "sdk/build-tools/34.0.4/aapt2").isFile && File(dir, "sdk/build-tools/34.0.4/lib/d8.jar").isFile
+            "kotlin" -> File(dir, "kotlin/lib/kotlin-compiler.jar").isFile &&
+                File(dir, "kotlin/lib/kotlin-stdlib.jar").isFile
             "r8" -> File(dir, "sdk/build-tools/34.0.4/lib/r8.jar").isFile
             "platform-36" -> File(dir, "sdk/platforms/android-36/android.jar").isFile
             "cmake-ninja" -> (File(dir, "cmake/bin/cmake").isFile || File(dir, "cmake/cmake").isFile) &&
@@ -262,6 +264,7 @@ class OnlineToolchainDownloader(
             "jdk17" -> File(sourceDir, "runtime")
             "gradle" -> File(sourceDir, "gradle")
             "build-tools" -> File(sourceDir, "sdk/build-tools/34.0.4")
+            "kotlin" -> File(sourceDir, "kotlin")
             "r8" -> File(sourceDir, "sdk/build-tools/34.0.4/lib/r8.jar")
             "platform-36" -> File(sourceDir, "sdk/platforms/android-36/android.jar")
             "cmake-ninja" -> File(sourceDir, "cmake")
@@ -272,6 +275,7 @@ class OnlineToolchainDownloader(
             "jdk17" -> File(staging, "runtime")
             "gradle" -> File(staging, "gradle")
             "build-tools" -> File(staging, "sdk/build-tools/34.0.4")
+            "kotlin" -> File(staging, "kotlin")
             "r8" -> File(staging, "sdk/build-tools/34.0.4/lib/r8.jar")
             "platform-36" -> File(staging, "sdk/platforms/android-36/android.jar")
             "cmake-ninja" -> File(staging, "cmake")

@@ -3,6 +3,12 @@ package com.aaryo.mobilestudio.toolchain
 import java.io.File
 
 class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunner()) {
+
+    private companion object {
+        /** AGP 9.1.1 requires Gradle 9.3.1 or newer. */
+        const val MINIMUM_GRADLE_VERSION = "9.3.1"
+    }
+
     private fun launcherVersionForLog(name: String): String =
         Regex("^gradle-launcher-(.+)\\.jar$").matchEntire(name)?.groupValues?.get(1) ?: "unknown"
 
@@ -29,14 +35,16 @@ class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunne
             File(lib, "plugins").listFiles().orEmpty().filter { it.isFile && it.extension == "jar" })
             .distinctBy { it.absolutePath }
 
-        // The Android-host runtime must use the Gradle version required by this project.
-        // AGP 9.1.1 is paired with Gradle 9.3.1; an 8.13 runtime (seen on affected devices)
-        // is not a valid substitute even if the project wrapper says 9.3.1.
-        val launcherVersion = Regex("^gradle-launcher-(.+)\\.jar$")
-            .matchEntire(launcher.name)?.groupValues?.get(1)
-        require(launcherVersion == "9.3.1") {
-            "Incompatible bundled Gradle $launcherVersion. This project uses AGP 9.1.1 and requires " +
-                "the Android-host Gradle 9.3.1 distribution. Reinstall/update the toolchain Gradle folder."
+        // The Android-host runtime must use a Gradle version AGP 9.1.1 understands.
+        // AGP 9.1.1 requires Gradle >= 9.3.1; an 8.x runtime (seen on affected devices) is not a
+        // valid substitute, but a newer 9.x distribution is fine.
+        val launcherVersion = launcherVersionForLog(launcher.name)
+        val launcherParts = Regex("\\d+").findAll(launcherVersion).mapNotNull { it.value.toIntOrNull() }.toList()
+        val launcherTooOld = launcherParts.isNotEmpty() &&
+            AndroidToolchain.compareVersions(launcherVersion, MINIMUM_GRADLE_VERSION) < 0
+        require(!launcherTooOld) {
+            "Incompatible bundled Gradle $launcherVersion. AGP 9.1.1 requires Gradle $MINIMUM_GRADLE_VERSION " +
+                "or newer on the Android host. Reinstall/update the Gradle component in the Toolchain screen."
         }
 
         // Gradle's Linux/AArch64 JNI payloads target glibc Linux, not Android/Bionic.
@@ -56,9 +64,11 @@ class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunne
         val classpath = jars.joinToString(File.pathSeparator) { it.absolutePath }
         val root = context.toolchainRoot
         val sdk = File(root, "sdk")
-        val homeDir = File(context.projectDir.parentFile, ".mobilestudio-home").apply { mkdirs() }
-        val tmpDir = File(context.projectDir.parentFile, ".mobilestudio-tmp").apply { mkdirs() }
-        val gradleUserHome = File(context.projectDir.parentFile, ".mobilestudio-gradle").apply { mkdirs() }
+        // projectDir can live directly in the workspace root, where parentFile may be null.
+        val scratchParent = context.projectDir.absoluteFile.parentFile ?: context.projectDir
+        val homeDir = File(scratchParent, ".mobilestudio-home").apply { mkdirs() }
+        val tmpDir = File(scratchParent, ".mobilestudio-tmp").apply { mkdirs() }
+        val gradleUserHome = File(scratchParent, ".mobilestudio-gradle").apply { mkdirs() }
 
         // AGP downloads an x86_64 Linux aapt2 from Maven by default. It cannot execute on
         // an Android ARM64 device, so every APK build fails at resource processing.
@@ -78,6 +88,11 @@ class GradleBuildEngine(private val runner: ToolProcessRunner = ToolProcessRunne
             }.lastOrNull()
         val aapt2Binary = buildToolsDir?.let { File(it, "aapt2") }
         aapt2Binary?.let { it.setExecutable(true, false) }
+        require(aapt2Binary?.isFile == true) {
+            "Android Build Tools are missing AAPT2. AGP would download the x86_64 Linux AAPT2, which cannot " +
+                "run on an Android device. Install/repair the Build Tools component in the Toolchain screen."
+        }
+        onLine("BUILD: Using Build Tools ${buildToolsDir?.name ?: "?"} with on-device AAPT2: ${aapt2Binary?.absolutePath}")
 
         // Pre-accept the standard SDK licenses so AGP never tries (and fails) to auto-download
         // components through a missing sdkmanager.

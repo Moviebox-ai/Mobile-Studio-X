@@ -57,6 +57,11 @@ class StandaloneAndroidTools(
         workingDirectory: File,
         manifestPackage: String? = null,
         packageId: String? = null,
+        minSdk: Int = 21,
+        targetSdk: Int? = null,
+        versionCode: Int? = null,
+        versionName: String? = null,
+        javaOutputDirectory: File? = null,
         onLine: (String) -> Unit = {}
     ): File {
         require(compiledResources.isFile) { "Compiled resources archive is missing." }
@@ -84,9 +89,19 @@ class StandaloneAndroidTools(
         require(jar.isFile) { "android.jar not found: ${jar.absolutePath}" }
         jar.setReadable(true, false)
 
+        // The min SDK has to come from the project. It used to be hard-coded to 29, which silently
+        // produced APKs that refused to install on the minSdk 26 devices the templates target.
+        require(minSdk >= 21) { "Android min SDK must be at least 21 (was $minSdk)." }
         val args = mutableListOf(aapt2.absolutePath, "link", "-o", outputAp.absolutePath,
             "-I", jar.absolutePath, "--manifest", effectiveManifest.absolutePath,
-            "--min-sdk-version", "29", compiledResources.absolutePath)
+            "--min-sdk-version", minSdk.toString(), compiledResources.absolutePath)
+        if (targetSdk != null) args.addAll(listOf("--target-sdk-version", targetSdk.toString()))
+        if (versionCode != null) args.addAll(listOf("--version-code", versionCode.toString()))
+        if (versionName != null) args.addAll(listOf("--version-name", versionName))
+        if (javaOutputDirectory != null) {
+            javaOutputDirectory.mkdirs()
+            args.addAll(listOf("--java", javaOutputDirectory.absolutePath))
+        }
         if (!manifestPackage.isNullOrBlank()) {
             args.addAll(listOf("--rename-manifest-package", manifestPackage))
         }

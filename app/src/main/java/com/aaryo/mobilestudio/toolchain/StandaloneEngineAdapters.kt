@@ -19,10 +19,16 @@ class Aapt2Engine(toolchainRoot: File, runner: ToolProcessRunner = ToolProcessRu
         workingDirectory: File,
         manifestPackage: String? = null,
         packageId: String? = null,
+        minSdk: Int = 21,
+        targetSdk: Int? = null,
+        versionCode: Int? = null,
+        versionName: String? = null,
+        javaOutputDirectory: File? = null,
         onLine: (String) -> Unit = {}
     ): File = tools.linkResources(
         compiledResourcesZip, manifest, outputAp, workingDirectory,
-        manifestPackage, packageId, onLine
+        manifestPackage, packageId, minSdk, targetSdk, versionCode, versionName,
+        javaOutputDirectory, onLine
     )
 }
 

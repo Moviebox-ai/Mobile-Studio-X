@@ -209,7 +209,71 @@ object ErrorDiagnosticsEngine {
             )
         }
 
-        // 9. Generic Fallback
+        // 9. AGP / Gradle / Kotlin plugin version mismatches
+        val pluginMismatch = fullText.contains("no longer required for Kotlin support", true) ||
+            fullText.contains("requires Gradle", true) ||
+            fullText.contains("Minimum supported Gradle version", true) ||
+            fullText.contains("Failed to apply plugin 'org.jetbrains.kotlin.android'", true) ||
+            fullText.contains("Unsupported class file major version", true)
+        if (pluginMismatch) {
+            val relevant = logs.filter {
+                it.contains("Gradle", true) || it.contains("plugin", true) || it.contains("AGP", true)
+            }
+            return BuildDiagnostic(
+                category = ErrorCategory.GRADLE_COMPATIBILITY,
+                title = "Gradle / Android Gradle Plugin version mismatch",
+                summary = "The project's build scripts target a different AGP/Gradle generation than the bundled toolchain.",
+                filePath = "build.gradle.kts / settings.gradle.kts",
+                lineNumber = null,
+                rootCause = "The bundled distribution is Gradle 9.3.1, and AGP 9.1.1 compiles Kotlin itself. " +
+                    "Build scripts using AGP 8.x and org.jetbrains.kotlin.android cannot run on it.",
+                recommendedFix = "Use the plugin versions shipped with new projects in this IDE: " +
+                    "id(\"com.android.application\") version \"9.1.1\" and " +
+                    "id(\"org.jetbrains.kotlin.plugin.compose\") version \"2.2.10\". " +
+                    "Remove org.jetbrains.kotlin.android from every module.",
+                relevantLogs = relevant.take(10)
+            )
+        }
+
+        // 10. Build Tools revision required by AGP is not installed
+        if (fullText.contains("Failed to find Build Tools revision", true) ||
+            fullText.contains("below the minimum supported version", true)
+        ) {
+            val revision = Regex("""Build Tools revision ([0-9.]+)""").find(fullText)?.groupValues?.getOrNull(1)
+            return BuildDiagnostic(
+                category = ErrorCategory.MISSING_SDK,
+                title = "Android Build Tools revision missing",
+                summary = "Android Build Tools ${revision ?: "required by the plugin"} are not installed on the device.",
+                filePath = "app/build.gradle.kts",
+                lineNumber = null,
+                rootCause = "AGP resolves the Build Tools revision from buildToolsVersion or its own default, and " +
+                    "SDK components cannot be downloaded automatically on-device.",
+                recommendedFix = "Either install the requested Build Tools revision, or set " +
+                    "buildToolsVersion = \"34.0.4\" (the revision bundled with this toolchain) in the app module.",
+                relevantLogs = logs.filter { it.contains("Build Tools", true) }.take(10)
+            )
+        }
+
+        // 11. Direct compiler: incomplete on-device toolchain
+        if (fullText.contains("build toolchain is incomplete", true) ||
+            fullText.contains("Missing components:", true)
+        ) {
+            val missing = logs.filter { it.trimStart().startsWith("•") }
+            return BuildDiagnostic(
+                category = ErrorCategory.MISSING_SDK,
+                title = "On-device build toolchain incomplete",
+                summary = "The direct compiler stopped before compiling because required tools are missing.",
+                filePath = "toolchain/",
+                lineNumber = null,
+                rootCause = "AAPT2, D8, apksigner, zipalign, android.jar or the Kotlin compiler is not installed, " +
+                    "so no valid APK could be produced.",
+                recommendedFix = "Open Tools ▸ Toolchain and run \"Download & install\" (or install the matching " +
+                    "archive with \"Install local ZIP\"), then build again.",
+                relevantLogs = missing.ifEmpty { logs.takeLast(10) }
+            )
+        }
+
+        // 12. Generic Fallback
         val errorLines = logs.filter {
             it.contains("FAILED", true) || it.contains("ERROR", true) || it.contains("Exception", true)
         }
