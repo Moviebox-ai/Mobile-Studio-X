@@ -370,7 +370,7 @@ class IdeViewModel(application: Application) : AndroidViewModel(application) {
      * captured once when the ViewModel was created, so a JDK installed afterwards still showed up
      * as "Missing" in the Toolchains & Runtime card while builds were already using it.
      */
-    private fun refreshRuntime(discardLog: Boolean) = withContext(Dispatchers.IO) {
+    private suspend fun refreshRuntime(discardLog: Boolean) = withContext(Dispatchers.IO) {
         ensureToolchainPermissions()
         val status = inspector.inspect()
         _runtime.value = status
