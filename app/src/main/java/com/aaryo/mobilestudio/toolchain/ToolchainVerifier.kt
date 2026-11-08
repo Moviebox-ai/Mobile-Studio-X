@@ -41,6 +41,12 @@ class ToolchainVerifier(context: Context) {
         lines += "Device ABI: ${android.os.Build.SUPPORTED_ABIS.joinToString()}"
         lines += "Toolchain root: ${root.absolutePath}"
 
+        // The JDK probe below runs with LD_PRELOAD=libtagfix.so, so a stale or malformed shim would
+        // make an otherwise healthy JDK look broken. Rebuild it from scratch first: this is exactly
+        // the recovery step the build errors point users at.
+        val shimCheck = verifyTagFixShim()
+        result("Heap-tagging shim (libtagfix.so)", shimCheck.first, shimCheck.second)
+
         val javaFile = java.takeIf { it.isFile } ?: File(root, "runtime/bin/java")
         val javaProbe = probe(javaFile, "-version")
         result("OpenJDK 17 ARM64", javaProbe.first, javaProbe.second)
@@ -115,6 +121,30 @@ class ToolchainVerifier(context: Context) {
     }
 
     private fun findExecutable(candidates: List<File>): File? = candidates.firstOrNull { it.isFile }
+
+    /**
+     * Deletes any cached copy, regenerates `toolchain/compat/libtagfix.so` from [TagFixShimElf] and
+     * confirms the file on disk passes the same structural checks Bionic applies. Returns
+     * `(ok, detail)` for the verification report.
+     */
+    private fun verifyTagFixShim(): Pair<Boolean?, String> {
+        if (!runCatching { android.os.Build.SUPPORTED_64_BIT_ABIS.any { it.contains("arm64", true) } }.getOrDefault(false)) {
+            return null to "device userspace is not 64-bit ARM; tools run without the shim"
+        }
+        val compatDir = File(root, "compat")
+        val shim = File(compatDir, "libtagfix.so")
+        BionicTagFixShim.resetCache()
+        runCatching { if (shim.isFile) shim.delete() }
+        val regenerated = BionicTagFixShim.ensureShimLibrary(root)
+            ?: return false to "could not write ${shim.absolutePath}"
+        val bytes = runCatching { regenerated.readBytes() }.getOrNull()
+        if (!TagFixShimElf.isUsableShim(bytes)) {
+            return false to "regenerated shim failed ELF validation (${bytes?.size ?: 0} bytes)"
+        }
+        val executable = regenerated.canExecute() || regenerated.setExecutable(true, false)
+        if (!executable) return false to "shim written but not executable"
+        return true to "${bytes!!.size} bytes, no R+W+X PT_LOAD, version marker ${TagFixShimElf.MARKER}"
+    }
 
     private fun probe(file: File?, argument: String): Pair<Boolean?, String> {
         if (file == null || !file.isFile) return false to "executable/file missing"

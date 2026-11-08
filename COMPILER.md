@@ -87,6 +87,38 @@ is non-null.
 * “Failed to find Build Tools revision X” — tells you to install it or pin `buildToolsVersion`.
 * Incomplete on-device toolchain — lists the missing tools and points at the Toolchain screen.
 
+## The `LD_PRELOAD` shim (`libtagfix.so`) and the W^X rejection
+
+Every child process the app starts (`java`, `javac`, `kotlinc`, `d8`, `aapt2`, `apksigner`) is
+launched with `LD_PRELOAD=toolchain/compat/libtagfix.so`. That tiny shared object calls
+`mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, M_HEAP_TAGGING_LEVEL_NONE)` from its constructor, before
+`main()` / `libjvm.so`, because the manifest attributes that disable heap tagging only apply to the
+Zygote-forked app process, not to binaries started with `execve()`. Without it the JDK aborts with
+`Pointer tag for 0x... was truncated` (exit 134).
+
+The library is generated on device by `TagFixShimElf` (`toolchain/TagFixShimElf.kt`), because the
+app cannot ship or run clang. Bionic's linker is strict, and the previous 4 KB image got these things wrong, each of which
+broke *every* tool:
+
+| Problem | Symptom | Fix |
+|---------|---------|-----|
+| one `PT_LOAD` with `PF_R\|PF_W\|PF_X` | `"libtagfix.so" has load segments that are both writable and executable` | split into `R+X` (code, phdrs, `.dynamic`) and `RW` (`.init_array`, `.got`) |
+| `p_align = 0x1000` | rejected on 16 KiB-page kernels once app-compat is off | `p_align = 0x4000` |
+| v1 built with `R_AARCH64_COPY` (1024) and no `DT_INIT_ARRAY` | GOT never filled, constructor never called | `R_AARCH64_GLOB_DAT` (1025) + `DT_INIT_ARRAY`/`DT_INIT_ARRAYSZ` |
+| `mallopt` imported as a strong symbol | hard link failure if a device lacks the export | `STB_WEAK` + `cbz` guard, so the constructor no-ops instead |
+
+`TagFixShimElf.isUsableShim()` re-checks a cached file on disk (size, ELF header, section header
+table, `e_shstrndx`, no W+X segment, `.comment` version marker). Anything older or malformed is
+rewritten before it can reach `LD_PRELOAD`, which is what repairs devices that already stored the
+broken v1 file.
+
+If Bionic still rejects the shim, `ToolProcessRunner` notices the loader's
+`CANNOT LINK EXECUTABLE` message, stops preloading it for the rest of the process and retries the
+command once *without* `LD_PRELOAD` — so the build continues (just without the heap-tagging fix)
+instead of failing with "the JDK cannot run". "Full toolchain verification" regenerates the file and
+re-runs `java -version`, and `ErrorDiagnosticsEngine` reports this case as a shim/loader problem
+instead of suggesting a JDK reinstall.
+
 ## Troubleshooting: "Mobile Studio X isn't responding" / stuck on "Gradle bootstrap"
 
 Those two symptoms came from the app itself, and both are fixed:
@@ -117,6 +149,10 @@ startup test failed` plus the raw reason, instead of the old, misleading "Missin
 `app/src/test/java/com/aaryo/mobilestudio/MobileStudioUnitTest.kt` covers:
 
 * the toolchain catalog (8 components incl. the Kotlin compiler, all with SHA-256);
+* the generated `libtagfix.so`: valid ELF64 header, no writable+executable `PT_LOAD`, 16 KiB
+  `p_align`, `.dynamic` matching `PT_DYNAMIC`, the twelve `init_tagfix` instructions, `GLOB_DAT`
+  relocation, stale/corrupt images being rejected, and the loader rejection being diagnosed as a
+  shim bug rather than a JDK problem;
 * generated projects using AGP 9.1.1 / built-in Kotlin / build-tools 34.0.4;
 * the direct compiler failing with an actionable message (and producing **no** APK) when tools are
   missing;
