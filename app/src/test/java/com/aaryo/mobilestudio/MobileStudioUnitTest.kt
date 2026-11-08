@@ -640,6 +640,61 @@ class MobileStudioUnitTest {
         assertFalse(active.isVerified)
     }
 
+    /**
+     * A SIGSEGV in `java -version` (exit 139) used to be reported as "Choose a Bionic-compatible JDK
+     * 17 archive", which sent users to re-download a perfectly good JDK. The exit status has to be
+     * translated into the signal that actually killed the process.
+     */
+    @Test
+    fun jvmExitCodesAreTranslatedIntoSignals() {
+        assertTrue(ErrorDiagnosticsEngine.describeExit(139).contains("SIGSEGV"))
+        assertTrue(ErrorDiagnosticsEngine.describeExit(134).contains("SIGABRT"))
+        assertTrue(ErrorDiagnosticsEngine.describeExit(137).contains("SIGKILL"))
+        assertEquals("no signal", ErrorDiagnosticsEngine.describeExit(1))
+    }
+
+    /**
+     * On SIGSEGV the JVM writes hs_err_pid<pid>.log; that file names the faulting library and is
+     * the only actionable evidence. It must be found and surfaced.
+     */
+    @Test
+    fun jvmFatalErrorLogsAreCollected() {
+        val dir = File.createTempFile("hserrdir", "tmp").apply { delete(); mkdirs() }
+        try {
+            File(dir, "hs_err_pid4321.log").writeText(
+                "# A fatal error has been detected by the Java Runtime Environment\n" +
+                    "#  SIGSEGV (0xb) at pc=0x0000007a1c2b3d40, pid=4321\n" +
+                    "# Problematic frame:\n# C  [libjvm.so+0x8f1a2c]  JVM_handle_linux_signal+0x1c\n"
+            )
+            val logs = ErrorDiagnosticsEngine.collectFatalLogs(listOf(dir))
+            assertTrue("crash log must be located", logs.contains("hs_err_pid4321.log"))
+            assertTrue("faulting frame must be visible", logs.contains("Problematic frame"))
+            assertTrue(logs.contains("libjvm.so"))
+        } finally {
+            dir.deleteRecursively()
+        }
+        // No crash log on disk must yield no section at all, not a blank header.
+        val empty = File.createTempFile("noerrordir", "tmp").apply { delete(); mkdirs() }
+        try {
+            assertEquals("", ErrorDiagnosticsEngine.collectFatalLogs(listOf(empty)))
+        } finally {
+            empty.deleteRecursively()
+        }
+    }
+
+    /** A native SIGSEGV is neither a heap-tagging abort nor a linker rejection. */
+    @Test
+    fun segfaultIsNotMisreadAsTaggedPointerOrLinkerFailure() {
+        val logs = listOf(
+            "# A fatal error has been detected by the Java Runtime Environment",
+            "#  SIGSEGV (0xb) at pc=0x0000007a1c2b3d40",
+            "# Problematic frame:",
+            "# C  [libjvm.so+0x8f1a2c]  JVM_handle_linux_signal"
+        ).joinToString("\n")
+        assertFalse(ErrorDiagnosticsEngine.isTaggedPointerAbort(logs))
+        assertFalse(ErrorDiagnosticsEngine.isLinkerRejection(logs))
+    }
+
     @Test
     fun heapTaggingAbortProducesActionableDiagnostics() {
         val logs = listOf(

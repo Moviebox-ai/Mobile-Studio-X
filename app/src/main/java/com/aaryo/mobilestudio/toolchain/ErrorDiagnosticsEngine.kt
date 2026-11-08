@@ -49,6 +49,43 @@ object ErrorDiagnosticsEngine {
         !isLinkerRejection(text) &&
             (text.contains("Pointer tag for", true) || text.contains("tagged-pointers", true))
 
+    /**
+     * Reads the newest `hs_err_pid*.log` files a crashed JVM may have written. A SIGSEGV (exit 139)
+     * without this is almost impossible to explain to a user; with it, the faulting frame names the
+     * library that is actually broken.
+     */
+    fun collectFatalLogs(roots: List<File?>, maxFiles: Int = 3, maxLines: Int = 100): String {
+        val files = roots.filterNotNull().filter { it.exists() }
+            .flatMap { root ->
+                runCatching {
+                    if (root.isFile) listOf(root)
+                    else root.walkTopDown().maxDepth(5)
+                        .filter { it.isFile && it.name.matches(Regex("hs_err_pid.*\\.log")) }
+                        .toList()
+                }.getOrDefault(emptyList())
+            }
+            .distinctBy { it.absolutePath }
+            .sortedByDescending { it.lastModified() }
+            .take(maxFiles)
+        return files.joinToString("\n\n") { file ->
+            val tail = runCatching { file.readLines().takeLast(maxLines).joinToString("\n") }
+                .getOrDefault("Unable to read ${file.absolutePath}")
+            "--- ${file.absolutePath} ---\n$tail"
+        }
+    }
+
+    /**
+     * Explains a JVM exit status in the words a user can act on. 128+n means the process was killed
+     * by signal n: 134 = SIGABRT, 137 = SIGKILL, 139 = SIGSEGV.
+     */
+    fun describeExit(exitCode: Int): String = when (exitCode) {
+        134 -> "SIGABRT - the JVM or a native library called abort()"
+        137 -> "SIGKILL - Android killed the process, usually for memory"
+        139 -> "SIGSEGV - a native crash inside the JVM or one of its libraries"
+        in 129..192 -> "killed by signal ${exitCode - 128}"
+        else -> "no signal"
+    }
+
     /** Analyzes build logs and extracts intelligent diagnostics. */
     fun analyze(logs: List<String>, projectDir: File?): BuildDiagnostic {
         val fullText = logs.joinToString("\n")

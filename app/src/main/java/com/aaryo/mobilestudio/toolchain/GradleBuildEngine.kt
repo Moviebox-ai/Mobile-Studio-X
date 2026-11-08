@@ -438,20 +438,6 @@ class GradleBuildEngine(
         }
     }
 
-    private fun collectFatalLogs(roots: List<File?>): String {
-        val files = roots.filterNotNull().filter { it.exists() }
-            .flatMap { root -> runCatching {
-                if (root.isFile) listOf(root) else root.walkTopDown().maxDepth(5)
-                    .filter { it.isFile && it.name.matches(Regex("hs_err_pid.*\\.log")) }
-                    .toList()
-            }.getOrDefault(emptyList()) }
-            .distinctBy { it.absolutePath }
-            .sortedByDescending { it.lastModified() }
-            .take(3)
-        return files.joinToString("\n\n") { file ->
-            val tail = runCatching { file.readLines().takeLast(100).joinToString("\n") }
-                .getOrDefault("Unable to read ${file.absolutePath}")
-            "--- ${file.absolutePath} ---\n$tail"
-        }
-    }
+    private fun collectFatalLogs(roots: List<File?>): String =
+        ErrorDiagnosticsEngine.collectFatalLogs(roots)
 }
