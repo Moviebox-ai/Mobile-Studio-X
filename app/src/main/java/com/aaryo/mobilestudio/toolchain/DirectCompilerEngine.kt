@@ -117,7 +117,18 @@ class DirectCompilerEngine(
         )
         val jvmText = jvmProbe.output.joinToString("\n")
         if (jvmProbe.exitCode != 0) {
-            val tagged = jvmText.contains("Pointer tag for", true) || jvmText.contains("tagged-pointers", true)
+            // Bionic refuses a library before main() runs; that is never the JDK's fault and
+            // reinstalling it would not help. Report what the loader actually said.
+            if (ErrorDiagnosticsEngine.isLinkerRejection(jvmText)) {
+                error(
+                    "Android's dynamic linker rejected a library needed to start the JDK, so javac, kotlinc, " +
+                        "D8 and apksigner could not run. The toolchain install itself looks fine.\n" +
+                        "Fix: Tools > Toolchain > Full toolchain verification regenerates the compatibility shim " +
+                        "and retries 'java -version'. If it still fails, the JDK archive is not a Bionic/Android build.\n" +
+                        "Raw JVM output:\n$jvmText"
+                )
+            }
+            val tagged = ErrorDiagnosticsEngine.isTaggedPointerAbort(jvmText)
             error(
                 if (tagged) {
                     "The on-device JVM cannot start on this device: Android aborted it with \"Pointer tag ... was truncated\" " +

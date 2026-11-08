@@ -396,6 +396,14 @@ class GradleBuildEngine(
      */
     private fun jvmCannotBootMessage(exitCode: Int, output: String): String {
         val tail = output.lineSequence().filter { it.isNotBlank() }.toList().takeLast(20).joinToString("\n")
+        if (ErrorDiagnosticsEngine.isLinkerRejection(output)) {
+            return "Android's dynamic linker rejected a library that the JVM needs, so the Gradle build could not " +
+                "start (exit $exitCode). This is not a JDK installation problem.\n" +
+                "What to do:\n" +
+                "  1. Tools > Toolchain > Full toolchain verification   (regenerates the compatibility shim)\n" +
+                "  2. Compiler Mode > Direct On-Device Compiler          (works without the shim)\n" +
+                "Raw JVM output:\n$tail"
+        }
         return if (looksLikeTaggedPointerAbort(output)) {
             "The on-device JVM cannot start on this device: Android aborted it with \"Pointer tag ... was truncated\" " +
                 "(a heap-tagging incompatibility, exit $exitCode). The build stopped here instead of retrying JVM flag " +
@@ -414,7 +422,7 @@ class GradleBuildEngine(
 
     /** The allocator's own message - more flag sets cannot fix it. */
     private fun looksLikeTaggedPointerAbort(text: String): Boolean =
-        text.contains("Pointer tag for", ignoreCase = true) || text.contains("tagged-pointers", ignoreCase = true)
+        ErrorDiagnosticsEngine.isTaggedPointerAbort(text)
 
     private fun readCachedFlags(): List<String>? = runCatching {
         val file = flagCacheFile ?: return null

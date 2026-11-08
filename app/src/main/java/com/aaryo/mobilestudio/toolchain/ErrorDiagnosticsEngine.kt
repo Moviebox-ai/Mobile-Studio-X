@@ -31,9 +31,58 @@ data class BuildDiagnostic(
 
 object ErrorDiagnosticsEngine {
 
+    /**
+     * True when the output contains a Bionic loader failure, i.e. the process never reached
+     * `main()`. A shim that Bionic refuses is not the JVM's fault, so these lines must never be
+     * reported as "reinstall the JDK".
+     */
+    fun isLinkerRejection(text: String): Boolean =
+        text.contains("CANNOT LINK EXECUTABLE", true) ||
+            text.contains("has load segments that are both writable and executable", true) ||
+            text.contains("has invalid e_shstrndx", true) ||
+            text.contains("has no section headers", true) ||
+            text.contains("is for EM_", true) ||
+            text.contains("cannot locate symbol", true)
+
+    /** True only for the allocator abort that heap tagging causes ("Pointer tag ... truncated"). */
+    fun isTaggedPointerAbort(text: String): Boolean =
+        !isLinkerRejection(text) &&
+            (text.contains("Pointer tag for", true) || text.contains("tagged-pointers", true))
+
     /** Analyzes build logs and extracts intelligent diagnostics. */
     fun analyze(logs: List<String>, projectDir: File?): BuildDiagnostic {
         val fullText = logs.joinToString("\n")
+
+        // The generated LD_PRELOAD shim itself was rejected by the loader. This is a bug in this
+        // app's compatibility layer, not a broken JDK - say so and offer a way out that does not
+        // need a working shim.
+        if (fullText.contains("libtagfix.so", true) && isLinkerRejection(fullText)) {
+            val relevant = logs.filter {
+                it.contains("linker", true) || it.contains("libtagfix.so", true) ||
+                    it.contains("CANNOT LINK", true) || it.contains("load segments", true) ||
+                    it.contains("e_shstrndx", true)
+            }
+            return BuildDiagnostic(
+                category = ErrorCategory.TAGGED_POINTER_SIGABRT,
+                title = "Android rejected the heap-tagging compatibility shim",
+                summary = "Bionic refused to load toolchain/compat/libtagfix.so, so every tool that " +
+                    "starts through execve() (java, javac, kotlinc, d8, aapt2) stopped before main().",
+                filePath = "toolchain/compat/libtagfix.so",
+                lineNumber = null,
+                rootCause = if (fullText.contains("writable and executable", true)) {
+                    "The shared object contains a load segment that is both writable and executable. " +
+                        "Android 8.0+ (API 26+) reject such segments (W^X)."
+                } else {
+                    "The shared object failed Bionic's ELF validation (section headers, program " +
+                        "headers or the dynamic section do not match)."
+                },
+                recommendedFix = "Run Tools > Toolchain > Full toolchain verification: it deletes the " +
+                    "cached shim, rebuilds it and re-runs java -version. If the error persists, set " +
+                    "MO_SKIP_TAGFIX=1 in the build environment to start tools without the shim, or use " +
+                    "Compiler Mode: Direct On-Device Compiler.",
+                relevantLogs = relevant.ifEmpty { logs.takeLast(20) }
+            )
+        }
 
         // Linker error on child process / shim
         if (fullText.contains("invalid e_shstrndx", true) || (fullText.contains("CANNOT LINK EXECUTABLE", true) && fullText.contains("libtagfix.so", true))) {
