@@ -119,6 +119,27 @@ instead of failing with "the JDK cannot run". "Full toolchain verification" rege
 re-runs `java -version`, and `ErrorDiagnosticsEngine` reports this case as a shim/loader problem
 instead of suggesting a JDK reinstall.
 
+## Why a JDK install can still fail verification (exit 139 / 134 / 137)
+
+`Tools ▸ Toolchain ▸ Download & install` probes the extracted runtime with
+`java -XX:ErrorFile=<cache>/jdk-probe/hs_err_pid%p.log -version` **twice**: once with the heap-tagging
+shim on `LD_PRELOAD` and, if that fails, once without it. The second run exists because the shim is
+only useful for this device's JVM; if the loader rejects it, blaming the download was wrong.
+
+Only when both runs fail is the archive itself declared unusable, and the message now says what
+actually happened instead of always suggesting a different download:
+
+| Exit | Meaning | Message / action |
+|------|---------|------------------|
+| 139 | `SIGSEGV` inside the JVM or a `.so` | crash log (`hs_err_pid*.log`) is read and attached; try a different JDK build |
+| 134 | `SIGABRT` (allocator, missing symbol) | same, with the fatal log |
+| 137 | `SIGKILL`, usually out of memory | "free RAM and retry", **not** a download problem |
+| linker rejection | `CANNOT LINK EXECUTABLE ...` naming the shim | points at Full toolchain verification, not at the archive |
+
+If the crash log shows `Problematic frame: C [libjvm.so+...]`, the archive's native libraries do not
+match this device (ABI, page size, or a missing dependency) — no amount of re-downloading the same
+URL fixes that; a different Android ARM64 JDK 17 build is required.
+
 ## Troubleshooting: "Mobile Studio X isn't responding" / stuck on "Gradle bootstrap"
 
 Those two symptoms came from the app itself, and both are fixed:

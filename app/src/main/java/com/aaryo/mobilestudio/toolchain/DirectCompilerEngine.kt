@@ -109,12 +109,26 @@ class DirectCompilerEngine(
         // javac, kotlinc, D8 and apksigner all run inside the JVM. If the device's JVM cannot even
         // print its version, every later step fails with a confusing tool error, so check it once
         // here and explain the real cause.
-        val jvmProbe = runner.run(
+        var jvmProbe = runner.run(
             listOf(toolchain.java!!.absolutePath, "-version"),
             layout.moduleDir,
             onLine = onLine,
             timeoutMinutes = 1
         )
+        if (jvmProbe.exitCode != 0 && BionicTagFixShim.shimApplied()) {
+            // The runner already retries loader rejections; this covers every other way the
+            // preloaded shim can take the JVM down before main() (missing .so, bad ABI, ...).
+            // Once is enough: the JDK is either usable without the shim or it is not usable at all.
+            onLine("  • [WARN] 'java -version' failed with the heap-tagging shim; retrying without it...")
+            BionicTagFixShim.disableForProcess()
+            jvmProbe = runner.run(
+                listOf(toolchain.java!!.absolutePath, "-version"),
+                layout.moduleDir,
+                mapOf("MO_SKIP_TAGFIX" to "1"),
+                onLine,
+                timeoutMinutes = 1
+            )
+        }
         val jvmText = jvmProbe.output.joinToString("\n")
         if (jvmProbe.exitCode != 0) {
             // Bionic refuses a library before main() runs; that is never the JDK's fault and
@@ -136,9 +150,16 @@ class DirectCompilerEngine(
                         "Fix: Tools > Toolchain > Download & install to reinstall JDK 17. If your device has Developer options > " +
                         "Memory Tagging Extension / heap tagging, disable it and reinstall this app.\n" +
                         "Raw JVM output:\n$jvmText"
+                } else if (jvmProbe.exitCode == 137) {
+                    "Android killed the JDK while starting it (exit 137, out of memory). Close other apps and " +
+                        "build again - reinstalling JDK 17 would not help.\nRaw JVM output:\n$jvmText"
                 } else {
-                    "The Android ARM64 JDK at ${toolchain.java?.absolutePath} cannot run (exit ${jvmProbe.exitCode}). " +
-                        "Reinstall JDK 17 from Tools > Toolchain.\nRaw JVM output:\n$jvmText"
+                    "The Android ARM64 JDK at ${toolchain.java?.absolutePath} cannot run " +
+                        "(exit ${jvmProbe.exitCode}: ${ErrorDiagnosticsEngine.describeExit(jvmProbe.exitCode)}).\n" +
+                        "This JDK failed even without the heap-tagging shim, so the runtime itself is the problem: " +
+                        "reinstall it from Tools > Toolchain (Download & install).\n" +
+                        fatalLogSuffix(layout.moduleDir) +
+                        "Raw JVM output:\n$jvmText"
                 }
             )
         }
@@ -549,6 +570,12 @@ class DirectCompilerEngine(
             ?: extractString(gradleText, "namespace")
             ?: extractString(gradleText, "applicationId")
             ?: "com.aaryo.mobilestudio"
+
+    /** Appends the newest JVM crash log, which is what actually explains a SIGSEGV/SIGABRT. */
+    private fun fatalLogSuffix(moduleDir: File): String {
+        val logs = ErrorDiagnosticsEngine.collectFatalLogs(listOf(moduleDir, moduleDir.parentFile))
+        return if (logs.isBlank()) "" else "JVM fatal log:\n$logs\n"
+    }
 
     private fun extractInt(text: String, key: String, fallback: Int): Int =
         Regex("""$key\s*=\s*(\d+)""").find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()

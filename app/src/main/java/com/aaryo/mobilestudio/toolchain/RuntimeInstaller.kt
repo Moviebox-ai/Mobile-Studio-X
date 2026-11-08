@@ -205,16 +205,52 @@ class RuntimeInstaller(private val context: Context) {
         // carry their own correct runtime search metadata.
         val runtimeHome = java.parentFile?.parentFile
             ?: throw IOException("Invalid JDK layout: expected runtime/bin/java.")
+
+        // The JDK is probed with the heap-tagging shim on LD_PRELOAD, exactly like the tools are.
+        // If the shim itself is the problem this probe fails - and the old code then reported
+        // "Choose a Bionic-compatible JDK 17 archive", blaming the download for a bug in our own
+        // compatibility layer. Probe a second time without the shim before drawing that conclusion.
+        val shimmedProbe = runJavaVersion(java, runtimeHome, useShim = true)
+        val probe = if (shimmedProbe.exitCode == 0) shimmedProbe else runJavaVersion(java, runtimeHome, useShim = false)
+        val usedShim = probe === shimmedProbe
+        val process = probe
+
+        val output = process.stdoutText
+        // Accept "17", "17.0.x", and vendor builds such as "17-internal" or "17+35".
+        val hasVersion17 = Regex("version \"17([.\\-+_\"]|$)").containsMatchIn(output) ||
+            output.contains("17.0", true) || releaseText.contains("JAVA_VERSION=\"17", true)
+        val isZeroOrTaggedWarn = process.exitCode == 0 || (hasVersion17 && output.isNotBlank())
+        if (!isZeroOrTaggedWarn || !hasVersion17) {
+            throw IOException(jdkStartupFailureMessage(shimmedProbe, probe, usedShim, output))
+        }
+    }
+
+    /** Runs `java -version` with a fixed environment, optionally without the LD_PRELOAD shim. */
+    private fun runJavaVersion(java: File, runtimeHome: File, useShim: Boolean): Probe {
+        val hsErrDir = File(context.cacheDir, "jdk-probe").apply { mkdirs() }
+        hsErrDir.listFiles()?.forEach { runCatching { it.delete() } }
         val process = try {
-            ProcessBuilder(java.absolutePath, "-version")
+            ProcessBuilder(
+                java.absolutePath,
+                "-version",
+                // Without an explicit ErrorFile the JVM writes hs_err_pid<pid>.log into the working
+                // directory, which on Android is often not writable, so a SIGSEGV left no trace.
+                "-XX:ErrorFile=" + File(hsErrDir, "hs_err_pid%p.log").absolutePath
+            )
                 .redirectErrorStream(true)
                 .apply {
                     val env = environment()
                     env["JAVA_HOME"] = runtimeHome.absolutePath
                     env["JAVA_TOOL_OPTIONS"] = "-XX:-UseCompressedOops -XX:-UseCompressedClassPointers"
+                    env["TMPDIR"] = hsErrDir.absolutePath
                     env.remove("_JAVA_OPTIONS")
                     env.remove("JDK_JAVA_OPTIONS")
-                    BionicTagFixShim.applyToEnvironment(runtimeHome, env)
+                    if (useShim) {
+                        BionicTagFixShim.applyToEnvironment(runtimeHome, env)
+                    } else {
+                        env.remove("LD_PRELOAD")
+                        env.remove("MO_SKIP_TAGFIX")
+                    }
                 }
                 .start()
         } catch (e: IOException) {
@@ -225,17 +261,38 @@ class RuntimeInstaller(private val context: Context) {
                 e
             )
         }
-        if (!process.waitFor(15, TimeUnit.SECONDS)) {
-            process.destroyForcibly()
-            throw IOException("JDK startup timed out. The runtime may be incompatible with this Android device.")
+        return Probe(process, hsErrDir)
+    }
+
+    /**
+     * Turns a failed `java -version` into something the user can act on. The old message always said
+     * "install a Bionic-compatible JDK 17", which is wrong for everything that is not actually a bad
+     * archive: a rejected shim, a SIGSEGV inside a `.so`, or low memory all produced the same text.
+     */
+    private fun jdkStartupFailureMessage(shimmedProbe: Probe, probe: Probe, usedShim: Boolean, output: String): String {
+        val exit = probe.exitCode
+        val fatal = ErrorDiagnosticsEngine.collectFatalLogs(listOf(probe.errorDir, context.cacheDir))
+        val detail = buildString {
+            append("JDK startup validation failed (exit $exit: ${ErrorDiagnosticsEngine.describeExit(exit)}).")
+            if (output.isNotBlank()) append(" Output: $output")
+            if (!usedShim) {
+                append("\nThe same failure happened with and without the heap-tagging shim (LD_PRELOAD), ")
+                append("so the runtime itself was rejected by this device.")
+            }
+            if (fatal.isNotBlank()) append("\nJVM fatal log:\n$fatal")
         }
-        val output = process.inputStream.bufferedReader().use { it.readText() }
-        // Accept "17", "17.0.x", and vendor builds such as "17-internal" or "17+35".
-        val hasVersion17 = Regex("version \"17([.\\-+_\"]|$)").containsMatchIn(output) ||
-            output.contains("17.0", true) || releaseText.contains("JAVA_VERSION=\"17", true)
-        val isZeroOrTaggedWarn = process.exitValue() == 0 || (hasVersion17 && output.isNotBlank())
-        require(isZeroOrTaggedWarn && hasVersion17) {
-            "JDK startup validation failed (exit ${process.exitValue()}). Install an Android/Bionic ARM64 JDK 17. Output: $output"
+        return when {
+            // It only failed while the shim was preloaded: our compatibility layer, not the archive.
+            usedShim && ErrorDiagnosticsEngine.isLinkerRejection(shimmedProbe.stdoutText) ->
+                "Android's linker rejected the heap-tagging shim that was preloaded for the JDK, so the " +
+                    "startup check could not complete. This is not a problem with the downloaded archive.\n" +
+                    "Fix: Tools > Toolchain > Full toolchain verification regenerates the shim, then retry.\n$detail"
+            exit == 137 ->
+                "Android killed the JDK while it was starting (out of memory). Close other apps / free RAM " +
+                    "and retry; this is not a download problem.\n$detail"
+            exit == 139 || exit == 134 ->
+                "The JDK crashed while starting.\n$detail"
+            else -> "$detail"
         }
     }
 
@@ -267,6 +324,14 @@ class RuntimeInstaller(private val context: Context) {
         if (File(root, "kotlin/lib/kotlin-compiler.jar").isFile) add("Kotlin compiler (kotlinc)")
         if (File(root, "ndk").isDirectory) add("Android NDK toolchain")
         if (File(root, "cmake").isDirectory) add("CMake and Ninja build tools")
+    }
+
+    /** A `java -version` probe plus the directory its crash log would be written to. */
+    private class Probe(val process: Process, val errorDir: File) {
+        val exitCode: Int get() = process.exitValue()
+        val stdoutText: String by lazy {
+            runCatching { process.inputStream.bufferedReader().use { it.readText() } }.getOrDefault("")
+        }
     }
 
     companion object {
